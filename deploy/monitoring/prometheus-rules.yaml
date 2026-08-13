@@ -1,0 +1,64 @@
+# PrometheusRules — alert definitions for the OpenTelemetry Demo
+# These fire when the demo app exhibits issues, triggering the agent's investigation
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: otel-demo-alerts
+  namespace: monitoring
+  labels:
+    release: kube-prometheus-stack
+spec:
+  groups:
+    - name: otel-demo
+      interval: 15s
+      rules:
+        # ---- Latency alerts ----
+        - alert: HighLatency
+          expr: |
+            histogram_quantile(0.99, rate(http_server_duration_bucket{service_name=~"checkoutservice|frontend|cartservice"}[5m])) > 0.5
+          for: 1m
+          labels:
+            severity: critical
+            service: '{{ $labels.service_name }}'
+            cluster: kind-e2e
+          annotations:
+            summary: '{{ $labels.service_name }} P99 latency > 500ms'
+            description: 'P99 latency for {{ $labels.service_name }} is {{ $value | humanizeDuration }} over the last 5 minutes.'
+
+        - alert: HighErrorRate
+          expr: |
+            rate(http_server_duration_count{service_name=~"checkoutservice|frontend|cartservice", http_response_status_code=~"5.."}[5m])
+            / rate(http_server_duration_count{service_name=~"checkoutservice|frontend|cartservice"}[5m]) > 0.1
+          for: 1m
+          labels:
+            severity: critical
+            service: '{{ $labels.service_name }}'
+            cluster: kind-e2e
+          annotations:
+            summary: '{{ $labels.service_name }} error rate > 10%'
+            description: '{{ $labels.service_name }} has a {{ $value | humanizePercentage }} error rate over the last 5 minutes.'
+
+        # ---- Pod restart alert ----
+        - alert: PodRestarting
+          expr: |
+            rate(kube_pod_container_status_restarts_total{namespace="otel-demo"}[10m]) > 0
+          for: 1m
+          labels:
+            severity: warning
+            cluster: kind-e2e
+          annotations:
+            summary: 'Pod {{ $labels.pod }} is restarting'
+            description: '{{ $labels.container }} in pod {{ $labels.pod }} has restarted {{ $value }} times in the last 10 minutes.'
+
+        # ---- CPU pressure alert ----
+        - alert: HighCPU
+          expr: |
+            rate(container_cpu_usage_seconds_total{namespace="otel-demo", container!=""}[5m]) * 100 > 1
+          for: 1m
+          labels:
+            severity: warning
+            service: '{{ $labels.container }}'
+            cluster: kind-e2e
+          annotations:
+            summary: '{{ $labels.container }} CPU usage is high'
+            description: 'Container {{ $labels.container }} has been using {{ $value | humanize }}% CPU for the last 5 minutes.'

@@ -1,0 +1,510 @@
+# Taskfile — end-to-end setup, deploy, and test automation for the observability agent.
+# Requires: task (https://taskfile.dev), kind, kubectl, helm
+# Docker runtime: auto-detects Colima or Docker Desktop. Override with DOCKER_RUNTIME env var.
+#
+# Quick start:
+#   task all              # Full pipeline: runtime → cluster → monitoring → demo → agent → e2e
+#   task e2e-setup        # Everything except running tests
+#   task e2e-test         # Run e2e tests only (cluster must be ready)
+#   task teardown         # Destroy the cluster
+#
+# Runtime (macOS):
+#   task runtime-start    # Auto-detect and start Docker runtime (Colima preferred)
+#   task runtime-status   # Show which runtime is active
+#
+# LLM configuration:
+#   export LLM_API_KEY="sk-..." && task all              # Real LLM
+#   task all                                              # Mock LLM (no API key needed)
+
+version: '3'
+
+vars:
+  CLUSTER_NAME: observability-e2e
+  MONITORING_NS: monitoring
+  AGENT_NS: observability-agent
+  DEMO_NS: otel-demo
+  AGENT_IMAGE: observability-agent:local
+  # Colima resource defaults — tune for your machine
+  COLIMA_CPUS: '{{.COLIMA_CPUS | default 6}}'
+  COLIMA_MEMORY: '{{.COLIMA_MEMORY | default 12}}'
+  COLIMA_DISK: '{{.COLIMA_DISK | default 60}}'
+
+# ---------------------------------------------------------------------------
+# Full pipeline
+# ---------------------------------------------------------------------------
+
+tasks:
+  all:
+    desc: Full pipeline — runtime, cluster, monitoring, loki, demo, agent, e2e tests
+    cmds:
+      - task: runtime-start
+      - task: cluster
+      - task: monitoring
+      - task: loki
+      - task: demo
+      - task: agent-build
+      - task: agent-deploy
+      - task: port-forward
+      - task: e2e-test
+
+  e2e-setup:
+    desc: Everything except running e2e tests
+    cmds:
+      - task: runtime-start
+      - task: cluster
+      - task: monitoring
+      - task: loki
+      - task: demo
+      - task: agent-build
+      - task: agent-deploy
+      - task: port-forward
+
+  # -------------------------------------------------------------------------
+  # Runtime (Colima / Docker Desktop)
+  # -------------------------------------------------------------------------
+
+  runtime-start:
+    desc: Auto-detect and start Docker runtime (Colima preferred on macOS, Docker Desktop fallback)
+    cmds:
+      - |
+        RUNTIME="{{.DOCKER_RUNTIME}}"
+        if [ "$RUNTIME" = "docker-desktop" ]; then
+          echo "Using Docker Desktop (explicit)"
+          if ! docker ps >/dev/null 2>&1; then
+            echo "ERROR: Docker Desktop is not running. Start it and retry."
+            exit 1
+          fi
+        elif [ "$RUNTIME" = "colima" ]; then
+          echo "Using Colima (explicit)"
+          if ! command -v colima >/dev/null 2>&1; then
+            echo "Installing colima..."
+            brew install colima docker
+          fi
+          if ! colima status 2>/dev/null | grep -q "Running"; then
+            echo "Starting Colima (cpus={{.COLIMA_CPUS}}, memory={{.COLIMA_MEMORY}}GiB, disk={{.COLIMA_DISK}}GiB)..."
+            colima start --cpu {{.COLIMA_CPUS}} --memory {{.COLIMA_MEMORY}} --disk {{.COLIMA_DISK}} --network-address --kubernetes=false
+          else
+            echo "Colima is already running"
+          fi
+          # Ensure docker CLI points at colima
+          docker context use colima 2>/dev/null || true
+        else
+          # Auto-detect: prefer Colima if installed, else Docker Desktop
+          if command -v colima >/dev/null 2>&1; then
+            echo "Colima detected — using Colima"
+            if ! colima status 2>/dev/null | grep -q "Running"; then
+              echo "Starting Colima (cpus={{.COLIMA_CPUS}}, memory={{.COLIMA_MEMORY}}GiB, disk={{.COLIMA_DISK}}GiB)..."
+              colima start --cpu {{.COLIMA_CPUS}} --memory {{.COLIMA_MEMORY}} --disk {{.COLIMA_DISK}} --network-address --kubernetes=false
+            else
+              echo "Colima is already running"
+            fi
+            docker context use colima 2>/dev/null || true
+          elif docker ps >/dev/null 2>&1; then
+            echo "Docker Desktop detected and running"
+          else
+            echo "No Docker runtime found."
+            echo "Install Colima:  brew install colima docker"
+            echo "Or start Docker Desktop and retry."
+            exit 1
+          fi
+        fi
+        echo "Docker runtime: $(docker context inspect --format '{{.Name}}' 2>/dev/null || echo 'default')"
+        docker ps >/dev/null 2>&1 && echo "Docker is ready" || { echo "ERROR: Docker is not responding"; exit 1; }
+
+  runtime-status:
+    desc: Show which Docker runtime is active
+    cmds:
+      - |
+        echo "Docker context: $(docker context inspect --format '{{.Name}}' 2>/dev/null || echo 'unknown')"
+        echo "Docker socket:  ${DOCKER_HOST:-unix:///var/run/docker.sock}"
+        docker info 2>/dev/null | grep -E "Server Version|Operating System|Total Memory|CPUs" || echo "Docker not reachable"
+        echo ""
+        if command -v colima >/dev/null 2>&1; then
+          echo "Colima:"
+          colima status 2>/dev/null || echo "  not installed"
+        fi
+
+  runtime-stop:
+    desc: Stop the Docker runtime
+    cmds:
+      - |
+        if command -v colima >/dev/null 2>&1 && colima status 2>/dev/null | grep -q "Running"; then
+          colima stop
+          echo "Colima stopped"
+        else
+          echo "No Colima instance running"
+        fi
+
+  # -------------------------------------------------------------------------
+  # Cluster
+  # -------------------------------------------------------------------------
+
+  cluster:
+    desc: Create Kind cluster
+    deps: [runtime-start]
+    cmds:
+      - |
+        if kind get clusters 2>/dev/null | grep -q "^{{.CLUSTER_NAME}}$"; then
+          echo "Cluster {{.CLUSTER_NAME}} already exists"
+        else
+          echo "Creating Kind cluster '{{.CLUSTER_NAME}}'..."
+          kind create cluster --name {{.CLUSTER_NAME}} --config deploy/kind-config.yaml
+          echo "Waiting for cluster to be ready..."
+          kubectl wait --for=condition=Ready nodes --all --timeout=120s
+        fi
+        echo "Cluster context: $(kubectl config current-context)"
+        echo "Nodes:"
+        kubectl get nodes
+
+  # -------------------------------------------------------------------------
+  # Monitoring stack
+  # -------------------------------------------------------------------------
+
+  monitoring:
+    desc: Deploy kube-prometheus-stack with Alertmanager → agent webhook
+    deps: [cluster]
+    cmds:
+      - |
+        helm repo add prometheus-community https://prometheus-community.github.io/helm-charts 2>/dev/null || true
+        helm repo update
+        kubectl create ns {{.MONITORING_NS}} --dry-run=client -o yaml | kubectl apply -f -
+
+      - |
+        echo "Deploying kube-prometheus-stack..."
+        helm upgrade --install kube-prometheus-stack prometheus-community/kube-prometheus-stack \
+          --namespace {{.MONITORING_NS}} \
+          --values deploy/monitoring/kube-prometheus-values.yaml \
+          --wait --timeout 5m
+
+      - kubectl apply -f deploy/monitoring/prometheus-rules.yaml
+      - kubectl apply -f deploy/monitoring/alertmanager-config.yaml
+
+      - |
+        echo "Waiting for Prometheus and Alertmanager to be ready..."
+        kubectl wait --for=condition=Ready pods -n {{.MONITORING_NS}} \
+          -l app.kubernetes.io/name=prometheus --timeout=120s || true
+        kubectl wait --for=condition=Ready pods -n {{.MONITORING_NS}} \
+          -l app.kubernetes.io/name=alertmanager --timeout=120s || true
+
+  loki:
+    desc: Deploy Loki + Promtail for log aggregation (ships all pod logs to Grafana)
+    deps: [cluster]
+    cmds:
+      - |
+        helm repo add grafana https://grafana.github.io/helm-charts 2>/dev/null || true
+        helm repo update
+        kubectl create ns {{.MONITORING_NS}} --dry-run=client -o yaml | kubectl apply -f -
+      - |
+        echo "Deploying loki-stack (Loki + Promtail)..."
+        helm upgrade --install loki grafana/loki-stack \
+          --namespace {{.MONITORING_NS}} \
+          --values deploy/monitoring/loki-values.yaml \
+          --wait --timeout 5m
+      - |
+        echo "Waiting for Loki to be ready..."
+        kubectl wait --for=condition=Ready pods -n {{.MONITORING_NS}} \
+          -l app=loki --timeout=120s || true
+      - |
+        # loki-stack always sets isDefault: true on its datasource ConfigMap,
+        # which conflicts with Prometheus (also isDefault: true) and crashes Grafana.
+        # Patch it to false so Prometheus stays the default.
+        kubectl patch configmap loki-loki-stack -n {{.MONITORING_NS}} --type=merge \
+          -p '{"data":{"loki-stack-datasource.yaml":"apiVersion: 1\ndatasources:\n- name: Loki\n  type: loki\n  access: proxy\n  url: \"http://loki:3100\"\n  version: 1\n  isDefault: false\n  jsonData:\n    {}\n"}}' 2>/dev/null || true
+        echo "Loki ready — logs available in Grafana under the Loki datasource"
+
+  # -------------------------------------------------------------------------
+  # OpenTelemetry Demo
+  # -------------------------------------------------------------------------
+
+  demo:
+    desc: Deploy OpenTelemetry Astronomy Shop demo application
+    deps: [cluster]
+    cmds:
+      - |
+        helm repo add open-telemetry https://open-telemetry.github.io/opentelemetry-helm-charts 2>/dev/null || true
+        helm repo update
+        kubectl create ns {{.DEMO_NS}} --dry-run=client -o yaml | kubectl apply -f -
+
+      - |
+        echo "Deploying OTEL demo..."
+        helm upgrade --install otel-demo open-telemetry/opentelemetry-demo \
+          --namespace {{.DEMO_NS}} \
+          --set opentelemetry-collector.resources.requests.cpu=50m \
+          --set opentelemetry-collector.resources.requests.memory=128Mi \
+          --set prometheus.enabled=false \
+          --set jaeger.enabled=false \
+          --set grafana.enabled=false \
+          --wait --timeout 10m
+
+      - |
+        echo "Waiting for OTEL demo pods..."
+        kubectl wait --for=condition=Ready pods -n {{.DEMO_NS}} --all --timeout=300s || true
+        echo "Demo services:"
+        kubectl get svc -n {{.DEMO_NS}}
+
+  # -------------------------------------------------------------------------
+  # Agent
+  # -------------------------------------------------------------------------
+
+  agent-build:
+    desc: Build the observability-agent Docker image and load into Kind
+    deps: [runtime-start]
+    cmds:
+      - docker build -t {{.AGENT_IMAGE}} -f deploy/agent/Dockerfile .
+      - kind load docker-image {{.AGENT_IMAGE}} --name {{.CLUSTER_NAME}}
+
+  agent-deploy:
+    desc: Deploy the observability agent to the cluster
+    deps: [agent-build]
+    cmds:
+      - kubectl apply -f deploy/agent/namespace.yaml
+      - kubectl apply -f deploy/agent/rbac.yaml
+      - kubectl apply -f deploy/agent/configmap.yaml
+      - |
+        kubectl create secret generic agent-secrets \
+          --namespace {{.AGENT_NS}} \
+          --from-literal=LLM_API_KEY="${LLM_API_KEY:-}" \
+          --from-literal=LLM_BASE_URL="${LLM_BASE_URL:-}" \
+          --dry-run=client -o yaml | kubectl apply -f -
+      - kubectl apply -f deploy/agent/deployment.yaml
+      - kubectl apply -f deploy/agent/service.yaml
+      - |
+        echo "Waiting for agent to be ready..."
+        kubectl wait --for=condition=Ready pods -n {{.AGENT_NS}} \
+          -l app=observability-agent --timeout=120s || true
+        echo "Agent pods:"
+        kubectl get pods -n {{.AGENT_NS}}
+
+  agent-configure-llm:
+    desc: Configure the agent with a real LLM API key and disable mock mode
+    cmds:
+      - |
+        if [ -z "${LLM_API_KEY}" ]; then
+          echo "ERROR: LLM_API_KEY is not set."
+          echo "Usage: export LLM_API_KEY=sk-... && task agent-configure-llm"
+          exit 1
+        fi
+      - |
+        kubectl create secret generic agent-secrets \
+          --namespace {{.AGENT_NS}} \
+          --from-literal=LLM_API_KEY="${LLM_API_KEY}" \
+          --from-literal=LLM_BASE_URL="${LLM_BASE_URL:-}" \
+          --dry-run=client -o yaml | kubectl apply -f -
+      - |
+        kubectl patch configmap agent-config -n {{.AGENT_NS}} -p '{"data": {"LLM_MOCK": "false"}}'
+      - |
+        kubectl rollout restart deployment/observability-agent -n {{.AGENT_NS}}
+      - |
+        kubectl wait --for=condition=Ready pods -n {{.AGENT_NS}} -l app=observability-agent --timeout=60s
+      - |
+        echo "Agent configured with real LLM. Model: ${LLM_MODEL:-openai:gpt-4o}"
+
+  agent-use-mock:
+    desc: Switch the agent back to mock mode (no LLM API key needed)
+    cmds:
+      - |
+        kubectl patch configmap agent-config -n {{.AGENT_NS}} -p '{"data": {"LLM_MOCK": "true"}}'
+      - |
+        kubectl rollout restart deployment/observability-agent -n {{.AGENT_NS}}
+      - |
+        kubectl wait --for=condition=Ready pods -n {{.AGENT_NS}} -l app=observability-agent --timeout=60s
+      - |
+        echo "Agent switched to mock mode"
+
+  agent-logs:
+    desc: Stream agent logs
+    cmds:
+      - kubectl logs -n {{.AGENT_NS}} -l app=observability-agent -f
+
+  agent-restart:
+    desc: Restart the agent deployment
+    cmds:
+      - kubectl rollout restart deployment/observability-agent -n {{.AGENT_NS}}
+
+  # -------------------------------------------------------------------------
+  # Port forwarding (all host access goes through kubectl port-forward)
+  # -------------------------------------------------------------------------
+
+  port-forward:
+    desc: Start port-forwarding for agent API, demo, and Prometheus
+    cmds:
+      - |
+        echo "Starting port-forwards..."
+        for port in 8080 9090 9091; do
+          lsof -ti:$port 2>/dev/null | xargs kill -9 2>/dev/null && echo "  Freed port $port" || true
+        done
+        kubectl port-forward -n {{.AGENT_NS}} svc/observability-agent 8080:8000 &
+        echo $! > /tmp/agent-port-forward.pid
+        kubectl port-forward -n {{.DEMO_NS}} svc/otel-demo-frontend 9090:8080 2>/dev/null &
+        echo $! > /tmp/demo-port-forward.pid
+        kubectl port-forward -n {{.MONITORING_NS}} svc/kube-prometheus-stack-prometheus 9091:9090 2>/dev/null &
+        echo $! > /tmp/prometheus-port-forward.pid
+        echo "Port-forwards started:"
+        echo "  Agent API:    http://localhost:8080"
+        echo "  Demo:         http://localhost:9090"
+        echo "  Prometheus:   http://localhost:9091"
+        sleep 2
+
+  stop-port-forward:
+    desc: Stop all port-forwards
+    cmds:
+      - |
+        for f in /tmp/agent-port-forward.pid /tmp/demo-port-forward.pid /tmp/prometheus-port-forward.pid; do
+          if [ -f "$f" ]; then
+            kill $(cat "$f") 2>/dev/null || true
+            rm "$f"
+          fi
+        done
+        echo "Port-forwards stopped"
+
+  # -------------------------------------------------------------------------
+  # Fault injection
+  # -------------------------------------------------------------------------
+
+  inject-latency:
+    desc: Trigger high latency on checkoutservice
+    cmds:
+      - |
+        echo "Triggering latency fault on checkoutservice..."
+        kubectl exec -n {{.DEMO_NS}} deploy/checkoutservice -- sh -c "echo 'Simulating latency...'" || true
+        echo "Check alerts: http://localhost:9091/api/v1/alerts"
+
+  inject-error:
+    desc: Trigger errors on cartservice
+    cmds:
+      - |
+        echo "Triggering error fault on cartservice..."
+        kubectl exec -n {{.DEMO_NS}} deploy/cartservice -- sh -c "echo 'Simulating errors...'" || true
+        echo "Check alerts: http://localhost:9091/api/v1/alerts"
+
+  inject-crash:
+    desc: Kill a pod to trigger restart detection
+    cmds:
+      - |
+        POD=$(kubectl get pods -n {{.DEMO_NS}} -l app=adservice -o jsonpath='{.items[0].metadata.name}')
+        echo "Deleting pod: $POD"
+        kubectl delete pod -n {{.DEMO_NS}} "$POD"
+        echo "Check alerts: http://localhost:9091/api/v1/alerts"
+
+  # -------------------------------------------------------------------------
+  # E2E tests
+  # -------------------------------------------------------------------------
+
+  e2e-test:
+    desc: Run end-to-end tests against the deployed cluster
+    cmds:
+      - |
+        echo "Running e2e tests..."
+        AGENT_URL=http://localhost:8080 \
+        PROMETHEUS_URL=http://localhost:9091 \
+        python -m pytest tests/e2e/ -v -m e2e --tb=long --timeout={{.E2E_TIMEOUT | default 600}}
+
+  e2e-test-latency:
+    desc: Run only the latency fault e2e test
+    cmds:
+      - |
+        AGENT_URL=http://localhost:8080 \
+        PROMETHEUS_URL=http://localhost:9091 \
+        python -m pytest tests/e2e/test_latency_fault.py -v --tb=long
+
+  # -------------------------------------------------------------------------
+  # Smoke test
+  # -------------------------------------------------------------------------
+
+  smoke-test:
+    desc: Quick smoke test — verify all components are reachable
+    cmds:
+      - |
+        echo "=== Agent Health ==="
+        curl -s http://localhost:8080/health | python3 -m json.tool || echo "Agent not reachable"
+        echo ""
+        echo "=== Active Incidents ==="
+        curl -s http://localhost:8080/incidents | python3 -m json.tool || echo "No incidents"
+        echo ""
+        echo "=== Prometheus Alerts ==="
+        curl -s http://localhost:9091/api/v1/alerts 2>/dev/null | python3 -m json.tool 2>/dev/null | head -30 || echo "Prometheus not reachable"
+        echo ""
+        echo "=== Memory Store ==="
+        curl -s http://localhost:8080/memory/incidents | python3 -m json.tool || echo "No archived incidents"
+
+  # -------------------------------------------------------------------------
+  # Teardown
+  # -------------------------------------------------------------------------
+
+  teardown:
+    desc: Destroy the Kind cluster and stop port-forwards
+    cmds:
+      - task: stop-port-forward
+      - kind delete cluster --name {{.CLUSTER_NAME}}
+      - echo "Cluster {{.CLUSTER_NAME}} deleted"
+
+  teardown-all:
+    desc: Destroy cluster, stop runtime, clean everything
+    cmds:
+      - task: stop-port-forward
+      - kind delete cluster --name {{.CLUSTER_NAME}} 2>/dev/null || true
+      - task: runtime-stop
+      - echo "All cleaned up"
+
+  # -------------------------------------------------------------------------
+  # Status
+  # -------------------------------------------------------------------------
+
+  status:
+    desc: Show cluster and component status
+    cmds:
+      - echo "=== Docker Runtime ==="
+      - docker context inspect --format '{{.Name}}' 2>/dev/null || echo "  unknown"
+      - echo ""
+      - echo "=== Kind Clusters ==="
+      - kind get clusters 2>/dev/null || echo "  (none)"
+      - echo ""
+      - echo "=== Nodes ==="
+      - kubectl get nodes 2>/dev/null || echo "  (cluster not reachable)"
+      - echo ""
+      - echo "=== Namespaces ==="
+      - kubectl get ns {{.MONITORING_NS}} {{.DEMO_NS}} {{.AGENT_NS}} 2>/dev/null || echo "  Some namespaces missing"
+      - echo ""
+      - echo "=== Agent Pods ==="
+      - kubectl get pods -n {{.AGENT_NS}} 2>/dev/null || echo "  No agent pods"
+      - echo ""
+      - echo "=== OTEL Demo Pods ==="
+      - kubectl get pods -n {{.DEMO_NS}} 2>/dev/null || echo "  No demo pods"
+      - echo ""
+      - echo "=== Alerts ==="
+      - curl -s http://localhost:9091/api/v1/alerts 2>/dev/null | python3 deploy/scripts/count-alerts.py 2>/dev/null || echo "  Prometheus not reachable"
+
+  # -------------------------------------------------------------------------
+  # Prerequisites check
+  # -------------------------------------------------------------------------
+
+  prereqs:
+    desc: Check that all required tools are installed
+    cmds:
+      - |
+        echo "Checking prerequisites..."
+        missing=0
+        for cmd in kind kubectl helm python3; do
+          if command -v $cmd >/dev/null 2>&1; then
+            echo "  ✓ $cmd ($(command -v $cmd))"
+          else
+            echo "  ✗ $cmd — NOT FOUND"
+            missing=1
+          fi
+        done
+        # Check for at least one Docker runtime
+        if command -v colima >/dev/null 2>&1; then
+          echo "  ✓ colima ($(command -v colima))"
+        elif docker ps >/dev/null 2>&1; then
+          echo "  ✓ docker ($(command -v docker))"
+        else
+          echo "  ✗ No Docker runtime found. Install colima: brew install colima docker"
+          missing=1
+        fi
+        if [ $missing -eq 1 ]; then
+          echo ""
+          echo "Install missing tools:"
+          echo "  brew install kind kubectl helm colima docker python@3.12"
+          exit 1
+        fi
+        echo "All prerequisites met."

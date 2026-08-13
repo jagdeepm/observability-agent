@@ -1,0 +1,88 @@
+# kube-prometheus-stack values — minimal footprint for local Kind cluster
+# Installs: Prometheus, Alertmanager, Grafana, kube-state-metrics, node-exporter
+
+prometheus:
+  prometheusSpec:
+    resources:
+      requests:
+        cpu: 100m
+        memory: 256Mi
+      limits:
+        cpu: 500m
+        memory: 512Mi
+    retention: 2h
+    # Scrape interval: 15s for fast feedback in e2e tests
+    scrapeInterval: 15s
+    evaluationInterval: 15s
+    # Accept OTLP push from the otel-demo collector (POST /api/v1/otlp/v1/metrics)
+    enableOTLPReceiver: true
+    # Don't require persistent volumes on Kind
+    storageSpec:
+      volumeClaimTemplate:
+        spec:
+          accessModes: ["ReadWriteOnce"]
+          resources:
+            requests:
+              storage: 1Gi
+
+alertmanager:
+  alertmanagerSpec:
+    resources:
+      requests:
+        cpu: 50m
+        memory: 64Mi
+      limits:
+        cpu: 200m
+        memory: 128Mi
+    configSecret: alertmanager-config
+
+grafana:
+  enabled: true
+  adminPassword: admin
+  resources:
+    requests:
+      cpu: 50m
+      memory: 128Mi
+    limits:
+      cpu: 200m
+      memory: 256Mi
+
+kube-state-metrics:
+  resources:
+    requests:
+      cpu: 25m
+      memory: 64Mi
+
+nodeExporter:
+  resources:
+    requests:
+      cpu: 25m
+      memory: 32Mi
+
+# Disable components we don't need for e2e tests
+defaultRules:
+  create: false
+  rules:
+    alertmanager: false
+    etcd: false
+    configReloaders: false
+    general: false
+    k8sContainerCpuUsageSecondsTotal: false
+    kubeApiserverAvailability: false
+    kubeApiserverBurnrate: false
+    kubeApiserverHistogram: false
+    kubeApiserverSlos: false
+    kubelet: false
+    kubeControllerManager: false
+    kubeProxy: false
+    kubePrometheusGeneral: false
+    kubePrometheusNodeRecording: false
+    kubernetesApps: false
+    kubernetesResources: false
+    kubernetesStorage: false
+    kubernetesSystem: false
+    network: false
+    node: false
+    nodeNetwork: false
+    prometheus: false
+    prometheusOperator: false

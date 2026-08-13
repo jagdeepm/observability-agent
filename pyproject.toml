@@ -1,0 +1,34 @@
+[project]
+name = "observability-agent"
+version = "0.1.0"
+description = "AI-Native Cloud Observability Agent — autonomous incident investigation"
+requires-python = ">=3.12"
+dependencies = [
+    "pydantic>=2.0",
+    "pydantic-ai>=2.14,<3.0",
+    "httpx>=0.27",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.24",
+    "pytest-timeout>=2.0",
+]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+markers = [
+    "e2e: end-to-end tests that require a running Kind cluster",
+    "slow: tests that take longer than 5 seconds",
+]
+
+[build-system]
+requires = ["setuptools>=75.0"]
+build-backend = "setuptools.build_meta"
+
+[project.scripts]
+observability-agent = "observability_agent.cli.main:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]

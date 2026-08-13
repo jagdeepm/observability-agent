@@ -1,0 +1,63 @@
+# Agent deployment — runs the observability-agent serve command
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: observability-agent
+  namespace: observability-agent
+  labels:
+    app: observability-agent
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: observability-agent
+  template:
+    metadata:
+      labels:
+        app: observability-agent
+    spec:
+      serviceAccountName: observability-agent
+      containers:
+        - name: agent
+          image: observability-agent:local
+          imagePullPolicy: IfNotPresent
+          command: ["observability-agent"]
+          args: ["serve", "--host", "0.0.0.0", "--port", "8000"]
+          ports:
+            - containerPort: 8000
+              name: http
+          envFrom:
+            - configMapRef:
+                name: agent-config
+          env:
+            - name: LLM_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: agent-secrets
+                  key: LLM_API_KEY
+                  optional: true
+            - name: LLM_BASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: agent-secrets
+                  key: LLM_BASE_URL
+                  optional: true
+          resources:
+            requests:
+              cpu: 50m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            initialDelaySeconds: 5
+            periodSeconds: 5
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            initialDelaySeconds: 15
+            periodSeconds: 30

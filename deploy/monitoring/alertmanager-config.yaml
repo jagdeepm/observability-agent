@@ -1,0 +1,30 @@
+# Alertmanager config — routes all alerts to the observability agent webhook
+apiVersion: v1
+kind: Secret
+metadata:
+  name: alertmanager-config
+  namespace: monitoring
+type: Opaque
+stringData:
+  alertmanager.yaml: |
+    global:
+      resolve_timeout: 5m
+
+    route:
+      group_by: ['alertname', 'service', 'cluster']
+      group_wait: 10s
+      group_interval: 10s
+      repeat_interval: 1h
+      receiver: 'observability-agent'
+      routes:
+        - match:
+            severity: critical
+          group_wait: 5s
+          repeat_interval: 30m
+          receiver: 'observability-agent'
+
+    receivers:
+      - name: 'observability-agent'
+        webhook_configs:
+          - url: 'http://observability-agent.observability-agent.svc.cluster.local:8000/alerts'
+            send_resolved: true

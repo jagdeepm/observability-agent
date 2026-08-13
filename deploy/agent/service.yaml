@@ -1,0 +1,17 @@
+# Agent service — exposes the API within the cluster and via NodePort
+apiVersion: v1
+kind: Service
+metadata:
+  name: observability-agent
+  namespace: observability-agent
+  labels:
+    app: observability-agent
+spec:
+  type: NodePort
+  selector:
+    app: observability-agent
+  ports:
+    - name: http
+      port: 8000
+      targetPort: 8000
+      nodePort: 30080
