@@ -291,7 +291,7 @@ class Coordinator:
         # Build a batch prompt with all hypotheses
         entries = []
         for h in hypotheses:
-            summaries = "\n".join(f"  - {e.summary}" for e in h.evidence)
+            summaries = "\n".join(f"  {prompts.format_evidence(e)}" for e in h.evidence)
             entries.append(
                 f"Hypothesis [{h.id}]: {h.statement}\nEvidence:\n{summaries}"
             )
@@ -348,7 +348,7 @@ class Coordinator:
 
         for hyp in confirmed:
             chain = hyp.ancestor_chain(incident.hypotheses)
-            summaries = [e.summary for e in hyp.evidence]
+            summaries = [prompts.format_evidence(e) for e in hyp.evidence]
             system_prompt, user_prompt = prompts.deepen_hypotheses_prompt(hyp, chain, summaries)
             output = await self.llm.generate_structured(
                 prompt=user_prompt,

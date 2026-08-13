@@ -7,6 +7,7 @@ from typing import Any
 
 from pydantic import BaseModel, Field
 
+from observability_agent.analysis import analyze_traces
 from observability_agent.domain.models import Evidence, EvidenceSource
 from observability_agent.infrastructure.llm_provider import LLMProvider
 from observability_agent.mcp.tempo import TempoClient
@@ -20,9 +21,9 @@ class TraceQLOutput(BaseModel):
 
 
 class TracesSummaryOutput(BaseModel):
+    """The slowest span is not asked of the LLM — it is computed in analysis.py."""
+
     summary: str = Field(description="Natural language summary of the trace results")
-    slowest_service: str = Field(default="", description="Service with the highest latency span")
-    bottleneck_span: str = Field(default="", description="The span causing the bottleneck")
 
 
 class TraceAgent:
@@ -81,10 +82,15 @@ class TraceAgent:
                 collected_by="trace_agent",
             )
 
+        analysis = analyze_traces(raw)
+
         summary_output = await self.llm.generate_structured(
-            prompt=f"Original query: {nl}\nTempo results:\n{str(raw)[:4000]}",
+            prompt=f"Original query: {nl}\n{analysis.text}",
             output_schema=TracesSummaryOutput,
-            system_prompt="Summarize trace results in 1-3 sentences. Identify the slowest service and bottleneck span.",
+            system_prompt=(
+                "Summarize these trace results in 1-3 sentences. The span tree and the "
+                "slowest span are already identified — explain what they imply."
+            ),
         )
         assert isinstance(summary_output, TracesSummaryOutput)
 
@@ -96,9 +102,8 @@ class TraceAgent:
                 "traceql": traceql_output.traceql,
                 "explanation": traceql_output.explanation,
                 "result": raw,
-                "slowest_service": summary_output.slowest_service,
-                "bottleneck_span": summary_output.bottleneck_span,
             },
+            signals=analysis.signals,
             hypothesis_id=hypothesis_id,
             collected_by="trace_agent",
         )

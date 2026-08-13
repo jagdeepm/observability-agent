@@ -178,9 +178,25 @@ Each of the six agents follows the same pattern:
 ```
 Natural language query → LLM translates to domain-specific query language
                        → MCP client executes the query
+                       → deterministic analysis computes the facts
                        → LLM summarizes the results
                        → Evidence object returned
 ```
+
+### Arithmetic in code, language in the LLM
+
+Metrics, logs, and traces pass through [`analysis.py`](src/observability_agent/analysis.py) before the LLM sees them. Percentiles, z-score anomaly detection, exact error counts, and the slowest span by self time are computed in Python — the LLM is asked only to put those facts into a sentence.
+
+```python
+# before — the LLM eyeballs a truncated dict and guesses
+prompt=f"Loki results:\n{str(raw)[:4000]}"          # → error_count: int, from the LLM
+
+# after — the LLM is handed counted facts
+"Log analysis: 415 lines, 415 error-level, 2 distinct messages."
+"  [ERROR] ×412 (12:00:03 → 12:07:41): OOMKilled container checkout"
+```
+
+The computed values travel on `Evidence.signals` and are rendered into every Coordinator prompt, so a hypothesis is confirmed or refuted against a measured value rather than a paraphrase of one. See [ADR-007](docs/adr/007-deterministic-evidence-precompute.md).
 
 | Agent | Source | Query Language | MCP Server |
 |---|---|---|---|
@@ -284,6 +300,7 @@ Requires Kind, Helm, [Task](https://taskfile.dev/), and Docker. See [`docs/e2e-t
 - [ADR-004](docs/adr/004-agent-protocol-pattern.md) — Agent protocol pattern for observability sources
 - [ADR-005](docs/adr/005-mock-everything-testing.md) — Mock-everything testing strategy
 - [ADR-006](docs/adr/006-multi-cluster-from-day-one.md) — Multi-cluster from day one
+- [ADR-007](docs/adr/007-deterministic-evidence-precompute.md) — Deterministic pre-compute of telemetry evidence
 
 ## Contributing
 

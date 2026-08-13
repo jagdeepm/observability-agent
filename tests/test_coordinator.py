@@ -157,6 +157,78 @@ async def test_full_happy_path():
     assert repo.save_count > 0
 
 
+@pytest.mark.asyncio
+async def test_computed_signals_reach_the_llm_prompts():
+    """Evidence signals are rendered into prompts — not stranded on the object.
+
+    Without this, signals could be computed correctly and influence nothing.
+    """
+    inc = make_incident()
+    coord, mock_llm, repo, agents = make_coordinator()
+    await repo.save(inc)
+
+    for key, source in [
+        ("metrics", EvidenceSource.PROMETHEUS),
+        ("logs", EvidenceSource.LOKI),
+        ("traces", EvidenceSource.TEMPO),
+        ("kubernetes", EvidenceSource.KUBERNETES),
+        ("deployment", EvidenceSource.DEPLOYMENT),
+        ("knowledge", EvidenceSource.DOCUMENTATION),
+    ]:
+        agents[key].register(Evidence(
+            source=source, query="exploratory", summary=f"{key} ok", collected_by=key,
+            signals={"anomaly": True, "p95": 4.2} if key == "metrics" else {},
+        ))
+
+    mock_llm.register(GenerateHypothesesOutput, GenerateHypothesesOutput(
+        hypotheses=[HypothesisProposal(statement="database connections are exhausted")]
+    ))
+    agents["metrics"].register(Evidence(
+        source=EvidenceSource.PROMETHEUS, query="q", summary="DB connections near max",
+        collected_by="metrics_agent", signals={"anomaly": True, "spike_count": 3},
+    ))
+    mock_llm.register(EvaluateHypothesesOutput, EvaluateHypothesesOutput(
+        evaluations=[
+            HypothesisEvaluation(hypothesis_id="will-be-set", status="confirmed",
+                                 confidence=0.9, reasoning="ok"),
+        ]
+    ))
+    mock_llm.register(DeepenHypothesesOutput, DeepenHypothesesOutput(child_hypotheses=[]))
+    mock_llm.register(RCAOutput, RCAOutput(
+        root_cause_summary="DB connections exhausted", confidence=0.9,
+        remediation_action="scale up",
+    ))
+
+    await coord.run(inc.id)
+
+    prompts = [c["prompt"] for c in mock_llm.calls]
+
+    # Hypothesis generation sees the exploratory signals
+    generation = next(p for p in prompts if "propose root-cause hypotheses" in p.lower())
+    assert "p95=4.2" in generation
+    assert "anomaly=True" in generation
+
+    # Hypothesis evaluation sees the targeted evidence signals
+    evaluation = next(p for p in prompts if p.startswith("Evaluate these hypotheses"))
+    assert "spike_count=3" in evaluation
+
+    # Evidence without signals renders exactly as before
+    assert "logs ok" in generation
+
+
+@pytest.mark.asyncio
+async def test_evidence_without_signals_renders_unchanged():
+    """The facts line is omitted entirely when there are no signals."""
+    from observability_agent.coordinator.prompts import format_evidence
+
+    plain = Evidence(
+        source=EvidenceSource.LOKI, query="q", summary="nothing unusual", collected_by="logs",
+    )
+
+    assert format_evidence(plain) == "- [loki] nothing unusual"
+    assert "facts" not in format_evidence(plain)
+
+
 # ---------------------------------------------------------------------------
 # Exploratory evidence
 # ---------------------------------------------------------------------------
