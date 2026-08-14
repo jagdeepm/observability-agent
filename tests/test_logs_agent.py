@@ -166,3 +166,69 @@ async def test_loki_unreachable_returns_error_evidence():
 
     assert evidence.summary.startswith("Error: Loki query failed")
     assert evidence.signals == {}
+
+
+# ---------------------------------------------------------------------------
+# Label discovery — the prompt must describe the Loki it is actually querying
+# ---------------------------------------------------------------------------
+
+
+class LabelStubLoki:
+    """Loki stub that reports label names and records the queries it receives."""
+
+    def __init__(self, labels: list[str] | None = None, payload: dict | None = None) -> None:
+        self._labels = labels if labels is not None else ["namespace", "pod", "container"]
+        self.payload = payload or {"data": {"resultType": "streams", "result": []}}
+
+    async def list_labels(self) -> list[str]:
+        return self._labels
+
+    async def query_logql(self, logql: str, limit: int = 100) -> dict:
+        return self.payload
+
+
+class LabelFailingLoki(LabelStubLoki):
+    async def list_labels(self) -> list[str]:
+        raise ConnectionError("connection refused")
+
+
+def logs_llm() -> MockLLMProvider:
+    llm = MockLLMProvider()
+    llm.register(LogQLOutput, LogQLOutput(logql='{namespace="otel-demo"}', explanation="all logs"))
+    llm.register(LogsSummaryOutput, LogsSummaryOutput(summary="Nothing unusual."))
+    return llm
+
+
+@pytest.mark.asyncio
+async def test_translation_prompt_names_the_real_labels():
+    """A selector on a label Loki does not have matches nothing, silently."""
+    llm = logs_llm()
+    agent = LogsAgent(llm=llm, loki=LabelStubLoki(["app", "namespace", "pod"]))
+
+    await agent("errors for payment?")
+
+    system = llm.calls[0]["system_prompt"]
+    assert "app, namespace, pod" in system
+
+
+@pytest.mark.asyncio
+async def test_translation_prompt_does_not_invent_a_service_label():
+    """Suggesting {service="..."} is what made the agent query a nonexistent label."""
+    llm = logs_llm()
+    agent = LogsAgent(llm=llm, loki=LabelStubLoki(["namespace", "pod"]))
+
+    await agent("errors for payment?")
+
+    assert 'service="' not in llm.calls[0]["system_prompt"]
+
+
+@pytest.mark.asyncio
+async def test_label_discovery_failure_still_produces_evidence():
+    """An unreachable label endpoint degrades the prompt, not the investigation."""
+    llm = logs_llm()
+    agent = LogsAgent(llm=llm, loki=LabelFailingLoki())
+
+    evidence = await agent("errors for payment?")
+
+    assert not evidence.summary.startswith("Error:")
+    assert "namespace" in llm.calls[0]["system_prompt"]

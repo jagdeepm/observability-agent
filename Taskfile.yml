@@ -270,6 +270,13 @@ tasks:
         kubectl create ns {{.DEMO_NS}} --dry-run=client -o yaml | kubectl apply -f -
 
       - |
+        # Fault injection patches flagd-config with kubectl, which takes
+        # server-side-apply ownership of .data and makes every later
+        # `helm upgrade` fail with a field-ownership conflict. Dropping the
+        # ConfigMap hands it back; Helm recreates it with the shipped defaults,
+        # which is what redeploying the demo should mean anyway.
+        kubectl delete configmap flagd-config -n {{.DEMO_NS}} --ignore-not-found
+      - |
         echo "Deploying OTEL demo {{.DEMO_CHART_VERSION}}..."
         helm upgrade --install otel-demo open-telemetry/opentelemetry-demo \
           --namespace {{.DEMO_NS}} \

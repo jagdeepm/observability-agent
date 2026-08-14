@@ -25,7 +25,7 @@ async def test_image_slow_load_triggers_investigation(cluster_ready):
     before = list_incident_ids()
     set_flag("imageSlowLoad", "10sec")
     try:
-        alert = await wait_for_alert("HighLatency")
+        alert = await wait_for_alert("HighLatency", service="frontend")
         assert alert["labels"].get("severity") in ("warning", "critical")
 
         incident = await wait_for_incident(exclude_ids=before)
@@ -46,7 +46,7 @@ async def test_shipping_slowdown_surfaces_slowest_span(cluster_ready):
     before = list_incident_ids()
     set_flag("intlShippingSlowdown", "10sec")
     try:
-        await wait_for_alert("HighLatency")
+        await wait_for_alert("HighLatency", service="checkout")
         incident = await wait_for_incident(exclude_ids=before)
         assert_rca(incident, expect_signals={"slowest_self_ms"})
     finally:
@@ -62,7 +62,7 @@ async def test_load_spike_with_cart_errors(cluster_ready):
     set_flag("loadGeneratorVUs", "50")
     set_flag("cartFailure", "50%")
     try:
-        await wait_for_alert("HighLatency")
+        await wait_for_alert("HighLatency", service="frontend")
         incident = await wait_for_incident(exclude_ids=before)
         assert_rca(incident)
     finally:

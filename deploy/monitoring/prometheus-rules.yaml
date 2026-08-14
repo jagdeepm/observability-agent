@@ -26,10 +26,15 @@ spec:
       rules:
         # P99 server-side latency, in seconds, per service.
         #
-        # Preference order: the spanmetrics connector (produced by the collector,
-        # so uniform across every language in the demo), then the stable HTTP
-        # semconv metric emitted by the SDKs directly. `or` takes the first
-        # non-empty vector, so exactly one of these contributes per service.
+        # Source is the spanmetrics connector: the collector derives it from every
+        # span, so it is uniform across the demo's nine languages. The SDKs' own
+        # HTTP metrics are not usable here — half the services are gRPC, and the
+        # HTTP ones disagree on semconv version (`http_server_duration_milliseconds`
+        # vs `http_server_request_duration_seconds`).
+        #
+        # The `or` covers the connector's pending milliseconds → seconds migration.
+        # Observed on chart 0.41.0: milliseconds. Only one branch has data, so no
+        # series is counted twice.
         - record: otel:service_latency_p99_seconds
           expr: |
             histogram_quantile(0.99, sum by (service_name, le) (
@@ -39,23 +44,39 @@ spec:
             histogram_quantile(0.99, sum by (service_name, le) (
               rate(traces_span_metrics_duration_seconds_bucket{span_kind="SPAN_KIND_SERVER"}[5m])
             ))
-            or
-            histogram_quantile(0.99, sum by (service_name, le) (
-              rate(http_server_request_duration_seconds_bucket[5m])
-            ))
 
-        # Fraction of server calls ending in error, per service. Span status is set
-        # by the SDKs for 5xx responses and unhandled RPC errors alike, so this
-        # covers the demo's gRPC services as well as its HTTP ones.
-        - record: otel:service_error_ratio
+        # Server calls ending in error, per second, per service.
+        #
+        # Span status alone is not enough. The .NET cart service returns gRPC
+        # FAILED_PRECONDITION under `cartFailure` but leaves its server span
+        # STATUS_CODE_UNSET, so a status-only rule cannot see that fault at all —
+        # verified against a live cluster, not assumed.
+        #
+        # So take the union of the three signals. All three select the same metric,
+        # so `or` deduplicates: a span that is both STATUS_CODE_ERROR and gRPC
+        # non-zero is one series, counted once.
+        - record: otel:service_errors_per_second
           expr: |
             sum by (service_name) (
               rate(traces_span_metrics_calls_total{span_kind="SPAN_KIND_SERVER", status_code="STATUS_CODE_ERROR"}[5m])
+              or
+              rate(traces_span_metrics_calls_total{span_kind="SPAN_KIND_SERVER", rpc_grpc_status_code=~"[1-9][0-9]*"}[5m])
+              or
+              rate(traces_span_metrics_calls_total{span_kind="SPAN_KIND_SERVER", http_response_status_code=~"5.."}[5m])
             )
-            /
-            clamp_min(sum by (service_name) (
+
+        - record: otel:service_calls_per_second
+          expr: |
+            sum by (service_name) (
               rate(traces_span_metrics_calls_total{span_kind="SPAN_KIND_SERVER"}[5m])
-            ), 0.001)
+            )
+
+        # Absent errors the numerator is an empty vector, and `A / B` on an empty A
+        # yields nothing rather than zero — which is the behaviour we want: no
+        # series, no alert.
+        - record: otel:service_error_ratio
+          expr: |
+            otel:service_errors_per_second / otel:service_calls_per_second
 
     # -----------------------------------------------------------------------
     # Alerts — all routed to the agent's webhook by alertmanager-config.yaml.
@@ -63,8 +84,13 @@ spec:
     - name: otel-demo
       interval: 15s
       rules:
+        # 4s, not the 500ms an SLO would use. Measured baseline on an idle Kind
+        # cluster: frontend-proxy P99 ~2.5s, ad ~1.9s (Java JIT warmup) with no
+        # fault injected. At 500ms those two alert permanently, and an e2e test
+        # waiting for HighLatency matches the standing alert instead of the fault
+        # it injected. The injected slowdowns are 5–10s, so 4s still catches them.
         - alert: HighLatency
-          expr: otel:service_latency_p99_seconds > 0.5
+          expr: otel:service_latency_p99_seconds > 4
           for: 1m
           labels:
             severity: critical
@@ -74,8 +100,13 @@ spec:
             summary: '{{ $labels.service_name }} P99 latency > 500ms'
             description: 'P99 latency for {{ $labels.service_name }} is {{ $value | humanizeDuration }} over the last 5 minutes.'
 
+        # 2%, from measurement on a live cluster rather than a round number:
+        #   baseline (no fault)   every service < 0.5%
+        #   cartFailure=100%      cart 4.5%   (only EmptyCart fails, not all traffic)
+        #   paymentFailure=100%   payment 26%, checkout 26% (propagates upstream)
+        # At the conventional 10% the cart scenario never alerts at all.
         - alert: HighErrorRate
-          expr: otel:service_error_ratio > 0.1
+          expr: otel:service_error_ratio > 0.02
           for: 1m
           labels:
             severity: critical
@@ -120,6 +151,10 @@ spec:
           for: 2m
           labels:
             severity: warning
+            # Without this the alert inherits kube-state-metrics' own `service`
+            # label (the scrape target), and the agent goes off investigating
+            # kube-prometheus-stack instead of the demo pod that is down.
+            service: '{{ $labels.pod }}'
             cluster: kind-e2e
           annotations:
             summary: 'Pod {{ $labels.pod }} is not ready'

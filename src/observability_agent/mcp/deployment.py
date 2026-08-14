@@ -21,6 +21,22 @@ class DeploymentClient:
         self.api_base = "https://api.github.com"
         self._client: httpx.AsyncClient | None = None
 
+    def _require_repo(self) -> None:
+        """Refuse to build a URL out of an empty repo name.
+
+        Without this, an unconfigured client requests
+        https://api.github.com/repos//commits — a real call to a public API with a
+        malformed path, answered with 404. The agent then reports that 404 as
+        evidence, and an investigation can end up rooting a production incident in
+        the agent's own missing configuration.
+        """
+        if not self.repo:
+            raise RuntimeError(
+                "Deployment history is not configured: set GITHUB_REPO "
+                "(as owner/name) and GITHUB_TOKEN. No deployment data is available "
+                "for this cluster."
+            )
+
     def _headers(self) -> dict[str, str]:
         h = {"Accept": "application/vnd.github+json"}
         if self.token:
@@ -34,6 +50,7 @@ class DeploymentClient:
 
     async def recent_commits(self, path: str = "", count: int = 10) -> list[dict[str, Any]]:
         """Get recent commits, optionally filtered by path."""
+        self._require_repo()
         client = await self._get_client()
         params: dict[str, Any] = {"per_page": count}
         if path:
@@ -48,6 +65,7 @@ class DeploymentClient:
 
     async def compare_commits(self, base: str, head: str) -> dict[str, Any]:
         """Get the diff between two commits/revisions."""
+        self._require_repo()
         client = await self._get_client()
         resp = await client.get(
             f"{self.api_base}/repos/{self.repo}/compare/{base}...{head}",
@@ -58,6 +76,7 @@ class DeploymentClient:
 
     async def list_deployments(self, environment: str = "production") -> list[dict[str, Any]]:
         """List recent deployments for a given environment."""
+        self._require_repo()
         client = await self._get_client()
         resp = await client.get(
             f"{self.api_base}/repos/{self.repo}/deployments",

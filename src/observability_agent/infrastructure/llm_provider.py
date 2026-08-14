@@ -60,7 +60,19 @@ class PydanticAIProvider:
             headers={
                 "HTTP-Referer": "https://github.com/observability-agent",
                 "X-Title": "observability-agent",
-            }
+            },
+            # Every other client in this codebase (Prometheus, Loki, Tempo, K8s,
+            # GitHub) sets an explicit timeout; this was the one that didn't.
+            # Without it, a stalled proxy or an oversized batch-evaluate prompt
+            # hangs the coroutine forever — observed live: an investigation stuck
+            # for 40+ minutes on one call, no error, no log line, nothing for the
+            # scheduler to retry. The Coordinator's LLM calls have no timeout or
+            # try/except of their own (unlike the agents' evidence gathering), so
+            # this is the only backstop. 120s is generous for one completion —
+            # long enough that a legitimately large hypothesis batch still
+            # finishes — but bounded, so a hang becomes a caught exception that
+            # the scheduler's existing retry-and-flag-stale path can handle.
+            timeout=httpx.Timeout(120.0, connect=10.0),
         )
         provider = OpenAIProvider(
             api_key=api_key or None,

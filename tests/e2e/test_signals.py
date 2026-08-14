@@ -30,7 +30,7 @@ async def test_signals_are_computed_from_real_payloads(cluster_ready):
     before = list_incident_ids()
     set_flag("cartFailure", "100%")
     try:
-        await wait_for_alert("HighErrorRate")
+        await wait_for_alert("HighErrorRate", service="cart")
         incident = await wait_for_incident(exclude_ids=before)
 
         async with httpx.AsyncClient() as client:

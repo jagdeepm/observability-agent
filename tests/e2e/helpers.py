@@ -150,9 +150,22 @@ def list_incident_ids() -> set[str]:
         return set()
 
 
-async def wait_for_alert(alert_name: str, timeout: int = E2E_TIMEOUT) -> dict[str, Any]:
+async def wait_for_alert(
+    alert_name: str,
+    *,
+    service: str | None = None,
+    timeout: int = E2E_TIMEOUT,
+) -> dict[str, Any]:
+    """Wait for an alert to fire, optionally for one specific service.
+
+    Pass `service` whenever the test injected a fault into a known service. The
+    demo runs hot on a local cluster and some alerts stand permanently — an
+    unfiltered wait returns one of those immediately and the test passes without
+    its fault ever having mattered.
+    """
     deadline = time.monotonic() + timeout
     last_error: Exception | None = None
+    seen: set[str] = set()
     async with httpx.AsyncClient() as client:
         while time.monotonic() < deadline:
             try:
@@ -160,16 +173,23 @@ async def wait_for_alert(alert_name: str, timeout: int = E2E_TIMEOUT) -> dict[st
                 resp.raise_for_status()
                 last_error = None
                 for alert in resp.json().get("data", {}).get("alerts", []):
-                    if (
-                        alert.get("labels", {}).get("alertname") == alert_name
-                        and alert.get("state") == "firing"
-                    ):
-                        return alert
+                    labels = alert.get("labels", {})
+                    if labels.get("alertname") != alert_name:
+                        continue
+                    seen.add(f"{labels.get('service', '?')}:{alert.get('state')}")
+                    if alert.get("state") != "firing":
+                        continue
+                    if service and labels.get("service") != service:
+                        continue
+                    return alert
             except Exception as exc:
                 last_error = exc
                 logger.debug("wait_for_alert polling error: %s", exc)
             await asyncio.sleep(POLL_INTERVAL)
-    msg = f"Alert {alert_name!r} did not fire within {timeout}s"
+    target = f"{alert_name!r}" + (f" for service {service!r}" if service else "")
+    msg = f"Alert {target} did not fire within {timeout}s"
+    if seen:
+        msg += f" (saw {alert_name} as: {', '.join(sorted(seen))})"
     if last_error:
         msg += f" (last error: {last_error})"
     raise TimeoutError(msg)

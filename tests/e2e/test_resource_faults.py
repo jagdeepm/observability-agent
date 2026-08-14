@@ -29,7 +29,7 @@ async def test_ad_high_cpu_triggers_investigation(cluster_ready):
     before = list_incident_ids()
     set_flag("adHighCpu", "on")
     try:
-        await wait_for_alert("HighCPU")
+        await wait_for_alert("HighCPU", service="ad")
         incident = await wait_for_incident(exclude_ids=before)
         assert_rca(incident)
     finally:
@@ -43,7 +43,7 @@ async def test_email_memory_leak_triggers_restart(cluster_ready):
     before = list_incident_ids()
     set_flag("emailMemoryLeak", "1000x")
     try:
-        await wait_for_alert("PodRestarting")
+        await wait_for_alert("PodRestarting", service="email")
         incident = await wait_for_incident(exclude_ids=before)
         assert_rca(incident)
     finally:
@@ -61,7 +61,7 @@ async def test_pod_crash_triggers_investigation(cluster_ready):
     before = list_incident_ids()
     kubectl("delete", "pod", "-n", DEMO_NAMESPACE, pod_name)
 
-    alert = await wait_for_alert("PodRestarting")
+    alert = await wait_for_alert("PodRestarting", service="ad")
     assert alert["labels"].get("severity") in ("warning", "critical")
 
     incident = await wait_for_incident(exclude_ids=before)

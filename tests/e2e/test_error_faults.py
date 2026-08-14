@@ -29,7 +29,7 @@ async def test_cart_failure_triggers_investigation(cluster_ready):
     before = list_incident_ids()
     set_flag("cartFailure", "100%")
     try:
-        alert = await wait_for_alert("HighErrorRate")
+        alert = await wait_for_alert("HighErrorRate", service="cart")
         assert alert["labels"].get("severity") in ("warning", "critical")
 
         incident = await wait_for_incident(exclude_ids=before)
@@ -46,7 +46,7 @@ async def test_payment_failure_triggers_investigation(cluster_ready):
     before = list_incident_ids()
     set_flag("paymentFailure", "100%")
     try:
-        await wait_for_alert("HighErrorRate")
+        await wait_for_alert("HighErrorRate", service="payment")
         incident = await wait_for_incident(exclude_ids=before)
         assert_rca(incident)
         assert len(incident["rca"]["causal_chain"]) >= 1
@@ -61,7 +61,7 @@ async def test_product_catalog_failure_triggers_investigation(cluster_ready):
     before = list_incident_ids()
     set_flag("productCatalogFailure", "on")
     try:
-        await wait_for_alert("HighErrorRate")
+        await wait_for_alert("HighErrorRate", service="product-catalog")
         incident = await wait_for_incident(exclude_ids=before)
         assert_rca(incident, expect_signals={"error_count"})
     finally:
