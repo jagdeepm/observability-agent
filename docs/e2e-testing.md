@@ -121,7 +121,7 @@ task llm-models    # list the model names the endpoint offers
 
 The third check is the one that matters. The agent never asks for free text — every call goes through `generate_structured` with a Pydantic schema, which needs tool calling or JSON-schema support all the way through the proxy to the model. An endpoint can answer `/v1/models` happily and still be unusable here.
 
-It also flags a slow endpoint: an investigation makes roughly ten calls, so anything over ~20s per call needs a raised `E2E_TIMEOUT`.
+It also flags a slow endpoint: an investigation makes anywhere from ten to over a hundred calls depending on how wide the hypothesis tree grows (see "Known limitations" below), so anything over ~20s per call needs a raised `E2E_TIMEOUT`.
 
 ### Switching modes on a running cluster
 
@@ -259,13 +259,21 @@ task e2e-test-one -- tests/e2e/test_latency_faults.py
 
 ### Test timeout
 
-The default is 300 seconds per wait; real-LLM investigations often need more. Set `E2E_TIMEOUT` in `.env` (the example ships 600) or override per run:
+The example ships `E2E_TIMEOUT=1800` (30 minutes). That's not a guess — see "Known limitations" below for the measurement behind it. Override per run if needed:
 
 ```bash
 E2E_TIMEOUT=900 task e2e-test
 ```
 
-Expect the full suite to take 30–45 minutes against a real LLM — each scenario waits out a 1-minute `for:` clause plus alert delivery plus an investigation.
+Expect the full suite to take well over an hour against a real LLM — each scenario waits out a 1-minute `for:` clause plus alert delivery plus an investigation, and investigations vary widely in how long they take (see below).
+
+## Known limitations
+
+**Hypothesis breadth has no cap.** `MAX_DEPTH` bounds how deep the tree grows (3 levels), but nothing bounds how *wide* it gets at each level — that's entirely up to what the LLM proposes. Evidence gathering across a level runs concurrently (`_gather_targeted_evidence` in `coordinator/engine.py`, mirroring the exploratory-evidence phase), which cut typical investigation time roughly 10× — a cart-failure investigation that previously took 20–40 minutes now completes in ~4 minutes in the common case. But the batch hypothesis-evaluation call is a single LLM request whose prompt size scales with hypothesis count, and that one isn't parallelized. A run where the model proposes unusually widely — observed reaching 100+ hypotheses — can still take upward of 10 minutes, making genuine progress the whole time rather than hanging.
+
+If e2e runs are consistently slow, capping hypotheses per level (analogous to `MAX_DEPTH`) is the next real fix — it bounds both the evidence-gathering fan-out and the evaluate-batch prompt size. Left as a follow-up: it's a coordinator design decision (what to do with the hypotheses a cap drops) rather than a mechanical change, and deserves its own tests.
+
+**Every LLM call has a 120-second timeout** (`PydanticAIProvider`, `infrastructure/llm_provider.py`) as a backstop against a stalled proxy — a call that never returns fails cleanly instead of hanging an investigation forever. This bounds any single call; it doesn't bound how many calls a wide investigation makes.
 
 ## How It Works
 

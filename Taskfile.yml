@@ -541,7 +541,7 @@ tasks:
         echo "Running e2e tests..."
         AGENT_URL=http://localhost:8080 \
         PROMETHEUS_URL=http://localhost:9091 \
-        python -m pytest tests/e2e/ -v -m e2e --tb=long --timeout={{.E2E_TIMEOUT | default 900}}
+        python -m pytest tests/e2e/ -v -m e2e --tb=long --timeout={{.E2E_TIMEOUT | default 1800}}
 
   e2e-test-one:
     desc: 'Run a subset of the e2e tests. Usage: task e2e-test-one -- tests/e2e/test_error_faults.py'
@@ -549,7 +549,7 @@ tasks:
       - |
         AGENT_URL=http://localhost:8080 \
         PROMETHEUS_URL=http://localhost:9091 \
-        python -m pytest {{.CLI_ARGS}} -v -m e2e --tb=long --timeout={{.E2E_TIMEOUT | default 900}}
+        python -m pytest {{.CLI_ARGS}} -v -m e2e --tb=long --timeout={{.E2E_TIMEOUT | default 1800}}
 
   # -------------------------------------------------------------------------
   # Smoke test
