@@ -229,6 +229,13 @@ tasks:
         helm repo update
         kubectl create ns {{.MONITORING_NS}} --dry-run=client -o yaml | kubectl apply -f -
       - |
+        # The isDefault patch below (kubectl patch) takes server-side-apply
+        # ownership of .data on this ConfigMap, so any later `helm upgrade`
+        # fails with a field-ownership conflict — every run after the first.
+        # Dropping it hands ownership back; Helm recreates it, and the patch
+        # a few lines down reapplies isDefault: false either way.
+        kubectl delete configmap loki-loki-stack -n {{.MONITORING_NS}} --ignore-not-found
+      - |
         echo "Deploying loki-stack (Loki + Promtail)..."
         helm upgrade --install loki grafana/loki-stack \
           --namespace {{.MONITORING_NS}} \
