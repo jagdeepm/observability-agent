@@ -29,11 +29,16 @@ New observability sources should follow the existing agent protocol ([ADR-004](d
 
 ## End-to-end tests
 
-The e2e suite deploys against a real Kind cluster running the OpenTelemetry Astronomy Shop demo, injects faults, and asserts the agent investigates them. It takes 10–15 minutes on first run. See [`docs/e2e-testing.md`](docs/e2e-testing.md).
+The e2e suite deploys against a real Kind cluster running the OpenTelemetry Astronomy Shop demo, flips the demo's own fault flags, and asserts the agent investigates them. It takes 15–20 minutes on first run. See [`docs/e2e-testing.md`](docs/e2e-testing.md).
 
 ```bash
+task env-init   # creates .env — put your LLM settings there
 task all
 ```
+
+`.env` holds credentials and is gitignored. Never commit it; `.env.example` is the only env file in the repo, and it carries placeholders only.
+
+Chart versions for the demo and Tempo are pinned in `Taskfile.yml`. Upstream renames services and feature flags between majors, which silently breaks the alert rules and the fault helpers — bump the pin deliberately, and re-run `task telemetry-check` afterwards.
 
 ## Reporting a security issue
 

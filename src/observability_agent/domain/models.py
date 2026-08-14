@@ -491,6 +491,9 @@ class Incident(BaseModel):
                     "source": e.source.value,
                     "query": e.query,
                     "summary": e.summary,
+                    # The measured facts, so a reader can check the narrative
+                    # against the numbers without opening a dashboard.
+                    "signals": e.signals,
                     "collected_by": e.collected_by,
                 }
                 for e in all_evidence

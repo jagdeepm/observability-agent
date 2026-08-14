@@ -429,6 +429,54 @@ def test_rca_report():
     assert report["remediation"] == "rollback checkout deployment to v1.2.3"
 
 
+def test_rca_report_carries_computed_signals():
+    """Measured facts reach the report, not just the narrative summary.
+
+    Without this the deterministic analysis is invisible to every consumer of the
+    API — a reader cannot check the prose against the numbers behind it.
+    """
+    inc = Incident(cluster_id="us-east-1", title="Checkout latency > 500ms")
+    inc.acknowledge()
+    hyp = inc.add_hypothesis("checkout is slow", created_by="coordinator")
+    inc.add_evidence(
+        Evidence(
+            source=EvidenceSource.PROMETHEUS,
+            query="up",
+            summary="Latency is elevated.",
+            signals={"anomaly": True, "p95": 0.82, "spike_count": 3},
+            hypothesis_id=hyp.id,
+            collected_by="metrics_agent",
+        )
+    )
+    hyp.confirm(0.9)
+    inc.produce_rca()
+
+    signals = inc.rca_report()["evidence"][0]["signals"]
+    assert signals["anomaly"] is True
+    assert signals["p95"] == 0.82
+    assert signals["spike_count"] == 3
+
+
+def test_rca_report_signals_default_to_empty():
+    """Sources without deterministic analysis still serialize cleanly."""
+    inc = Incident(cluster_id="us-east-1", title="Checkout latency > 500ms")
+    inc.acknowledge()
+    hyp = inc.add_hypothesis("a bad deploy went out", created_by="coordinator")
+    inc.add_evidence(
+        Evidence(
+            source=EvidenceSource.DEPLOYMENT,
+            query="git log -1",
+            summary="v1.2.4 shipped 6 minutes before the alert.",
+            hypothesis_id=hyp.id,
+            collected_by="deployment_agent",
+        )
+    )
+    hyp.confirm(0.7)
+    inc.produce_rca()
+
+    assert inc.rca_report()["evidence"][0]["signals"] == {}
+
+
 # ---------------------------------------------------------------------------
 # Stale detection
 # ---------------------------------------------------------------------------

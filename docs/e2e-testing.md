@@ -5,32 +5,39 @@ The observability agent ships with a full end-to-end test harness that deploys t
 ## Architecture
 
 ```
-┌─────────────────────────────────────────────────────────┐
-│  Kind Cluster (observability-e2e)                       │
-│                                                         │
-│  ┌──────────────────┐   ┌──────────────────────────┐   │
-│  │ OTEL Demo (12 svc)│   │ kube-prometheus-stack     │   │
-│  │                    │   │                            │   │
-│  │ checkoutservice    │──▶│ Prometheus (scrape metrics)│   │
-│  │ cartservice        │   │ Alertmanager              │   │
-│  │ adservice          │   │ Grafana                   │   │
-│  │ ...                │   └──────────┬───────────────┘   │
-│  └──────────────────┘              │ webhook            │
-│                                    ▼                    │
-│  ┌──────────────────────────────────────────────────┐   │
-│  │ observability-agent                              │   │
-│  │                                                  │   │
-│  │  POST /alerts  ← Alertmanager webhook            │   │
-│  │  GET  /incidents  → investigation results         │   │
-│  │  GET  /health     → health check                 │   │
-│  │                                                  │   │
-│  │  Coordinator → LLM → 6 agents → MCP servers      │   │
-│  └──────────────────────────────────────────────────┘   │
-└─────────────────────────────────────────────────────────┘
-         │                    │
-    localhost:8080      localhost:9091
-    (agent API)         (Prometheus)
+┌────────────────────────────────────────────────────────────────────┐
+│  Kind Cluster (observability-e2e)                                  │
+│                                                                    │
+│  ┌───────────────────┐         ┌───────────────────────────────┐  │
+│  │ OTEL Demo         │  OTLP   │ monitoring                    │  │
+│  │  (ns: otel-demo)  │ metrics │                               │  │
+│  │                   │────────▶│ Prometheus  ← alert rules     │  │
+│  │  cart   checkout  │  OTLP   │ Alertmanager ─┐               │  │
+│  │  payment  ad      │ traces  │ Tempo         │               │  │
+│  │  shipping  email  │────────▶│ Loki  ◀── Promtail (pod logs) │  │
+│  │  frontend  ...    │         │ Grafana       │               │  │
+│  │                   │         └───────────────┼───────────────┘  │
+│  │  flagd ← faults   │                         │ webhook          │
+│  └───────────────────┘                         ▼                  │
+│  ┌──────────────────────────────────────────────────────────────┐ │
+│  │ observability-agent                                          │ │
+│  │   POST /alerts     ← Alertmanager webhook                    │ │
+│  │   GET  /incidents  → investigation results (RCA + signals)   │ │
+│  │   GET  /health     → health check                            │ │
+│  │                                                              │ │
+│  │   Coordinator → 6 agents → Prometheus / Loki / Tempo / K8s   │ │
+│  │                 ↳ deterministic analysis → LLM → Evidence    │ │
+│  └──────────────────────────────────────────────────────────────┘ │
+└────────────────────────────────────────────────────────────────────┘
+      │              │              │            │            │
+ localhost:8080  :9090         :9091        :3100        :3200
+  (agent API)   (demo UI)   (Prometheus)    (Loki)      (Tempo)
 ```
+
+The demo ships its own Prometheus, Jaeger, Grafana and OpenSearch. All four are
+disabled in `deploy/monitoring/otel-demo-values.yaml` and the collector's exporters
+are re-targeted at the monitoring stack above — otherwise both telemetry pipelines
+export into services that do not exist, and no latency or error alert can fire.
 
 ## Prerequisites
 
@@ -50,51 +57,81 @@ git clone <repo-url> && cd observability-agent
 python3 -m venv .venv && source .venv/bin/activate
 pip install -e ".[dev]"
 
-# Run everything (cluster → monitoring → demo → agent → tests)
+# Configure the LLM
+task env-init          # creates .env from .env.example
+$EDITOR .env           # fill in LLM_BASE_URL, LLM_API_KEY, LLM_MODEL
+
+# Run everything (cluster → monitoring → loki → tempo → demo → agent → tests)
 task all
 ```
 
-This takes ~10–15 minutes on first run (pulling images, building the agent). Subsequent runs are faster.
+This takes ~15–20 minutes on first run (pulling images, building the agent). Subsequent runs are faster.
 
-## Running with a Real LLM
+Without an `LLM_API_KEY` the agent still deploys, in mock mode — useful for checking the cluster wiring, but the investigations are canned.
 
-The agent uses a mock LLM by default (canned responses, no API key needed). To use a real LLM so the e2e tests exercise genuine hypothesis generation and evaluation:
+## Configuring the LLM
 
-```bash
-export LLM_API_KEY="sk-..."
-export LLM_MODEL="openai:gpt-4o"          # optional, default
-export LLM_BASE_URL=""                     # optional, for non-OpenAI providers
+Every `task` target loads `.env` automatically. A variable already exported in your shell wins over the file, so CI can inject secrets without writing one.
 
-task all
+```dotenv
+# .env
+LLM_BASE_URL=https://litellm.example.com/v1
+LLM_API_KEY=sk-litellm-xxxxxxxxxxxx
+LLM_MODEL=claude-sonnet-4-5
 ```
 
-The `LLM_API_KEY` is injected into the cluster as a Kubernetes Secret at deploy time. The agent pod reads it via `secretKeyRef`.
+`LLM_API_KEY` and `LLM_BASE_URL` become a Kubernetes Secret; the pod reads them via `secretKeyRef`. `LLM_MODEL` is patched into the `agent-config` ConfigMap. `LLM_MOCK` is derived — mock mode iff no API key is set.
 
-### LLM Providers
+### LiteLLM proxy
+
+The expected setup. Point `LLM_BASE_URL` at the proxy's OpenAI-compatible route (the `/v1` suffix matters), use a virtual key, and name the model exactly as it appears in the proxy's `model_list`:
+
+```dotenv
+LLM_BASE_URL=https://litellm.internal/v1
+LLM_API_KEY=sk-litellm-...
+LLM_MODEL=claude-sonnet-4-5
+```
+
+Model names pass through verbatim unless they look like `provider:model`, in which case the prefix is stripped — so `claude-sonnet-4-5` and `anthropic/claude-sonnet-4-5` both reach the proxy unchanged, while `openai:gpt-4o` arrives as `gpt-4o`.
+
+### Other providers
 
 Any OpenAI-compatible API works:
 
-```bash
+```dotenv
 # OpenAI
-export LLM_API_KEY="sk-..." LLM_MODEL="openai:gpt-4o"
-
-# Anthropic (via compatible proxy)
-export LLM_API_KEY="sk-ant-..." LLM_MODEL="anthropic:claude-sonnet-5"
+LLM_API_KEY=sk-...
+LLM_MODEL=openai:gpt-4o
 
 # Local model (Ollama, vLLM, LM Studio)
-export LLM_API_KEY="not-needed" \
-       LLM_BASE_URL="http://localhost:11434/v1" \
-       LLM_MODEL="openai:llama3"
+LLM_API_KEY=not-needed
+LLM_BASE_URL=http://localhost:11434/v1
+LLM_MODEL=openai:llama3
 ```
 
 ### Switching modes on a running cluster
 
 ```bash
-export LLM_API_KEY="sk-..."
-task agent-configure-llm    # patches secret, toggles mock=false, restarts pod
-
+task agent-configure-llm    # re-reads .env, patches secret + configmap, restarts the pod
 task agent-use-mock         # switches back to mock mode
 ```
+
+## Iterating locally
+
+The full loop — docker build, `kind load`, rollout — is several minutes. For prompt and LLM work, run the agent on your machine against the port-forwarded backends instead:
+
+```bash
+task port-forward     # agent, demo, Prometheus, Loki, Tempo
+task run-local        # agent on http://127.0.0.1:8081, reading .env
+
+# in another shell — Alertmanager cannot reach your laptop, so feed it by hand
+task send-test-alert
+task send-test-alert SERVICE=checkout ALERTNAME=HighLatency
+
+curl -s http://127.0.0.1:8081/incidents | python3 -m json.tool
+```
+
+This queries the same real Prometheus, Loki and Tempo the in-cluster agent uses. Only the agent process is local.
 
 ## Taskfile Reference
 
@@ -104,7 +141,7 @@ Every operation is a `task` target. Run `task --list` to see all available comma
 
 | Task | Description |
 |---|---|
-| `task all` | Cluster → monitoring → demo → agent → e2e tests |
+| `task all` | Cluster → monitoring → loki → tempo → demo → agent → e2e tests |
 | `task e2e-setup` | Everything except running the tests |
 | `task teardown` | Destroy the Kind cluster |
 
@@ -112,27 +149,35 @@ Every operation is a `task` target. Run `task --list` to see all available comma
 
 | Task | Description |
 |---|---|
+| `task env-init` | Create `.env` from `.env.example` |
 | `task cluster` | Create the Kind cluster (`observability-e2e`) |
 | `task monitoring` | Deploy kube-prometheus-stack (Prometheus + Alertmanager + Grafana) |
+| `task loki` | Deploy Loki + Promtail (ships every pod's stdout) |
+| `task tempo` | Deploy Tempo (trace backend for the TraceAgent) |
 | `task demo` | Deploy OpenTelemetry Astronomy Shop Demo |
 | `task agent-build` | Build the agent Docker image and load it into Kind |
 | `task agent-deploy` | Deploy the agent with RBAC, ConfigMap, Secret, and Service |
-| `task port-forward` | Forward agent:8080, demo:9090, prometheus:9091 to localhost |
+| `task port-forward` | Forward agent:8080, demo:9090, prometheus:9091, loki:3100, tempo:3200 |
 
 ### Fault injection
 
+Faults come from the demo's own flagd feature flags, so the failures are real: the service genuinely errors, genuinely logs, genuinely shows up in traces.
+
 | Task | Description |
 |---|---|
-| `task inject-latency` | Trigger high latency on checkoutservice |
-| `task inject-error` | Trigger error rate spike on cartservice |
-| `task inject-crash` | Kill a pod to trigger restart detection |
+| `task list-faults` | List every flag in the deployed demo and its current variant |
+| `task inject-fault -- cartFailure 100%` | Flip a flag |
+| `task reset-faults` | Return every flag to its shipped default |
+| `task inject-crash` | Kill an ad pod to trigger restart detection |
+
+**Flipping a flag restarts flagd.** The flag lives in the `flagd-config` ConfigMap, but flagd does not read it from there — an initContainer copies the file into an `emptyDir` at pod start and flagd watches that copy. Patching the ConfigMap alone is inert, so every write is followed by `kubectl rollout restart deployment/flagd`. Budget ~15 seconds per flag change, and expect a few seconds of flag-evaluation blips in the demo while the pod comes back.
 
 ### Testing
 
 | Task | Description |
 |---|---|
-| `task e2e-test` | Run all 5 e2e tests |
-| `task e2e-test-latency` | Run only the latency fault test |
+| `task e2e-test` | Run all e2e tests |
+| `task e2e-test-one -- tests/e2e/test_error_faults.py` | Run a subset |
 | `task smoke-test` | Quick API checks (health, incidents, alerts, memory) |
 
 ### Agent management
@@ -141,55 +186,70 @@ Every operation is a `task` target. Run `task --list` to see all available comma
 |---|---|
 | `task agent-logs` | Stream agent pod logs |
 | `task agent-restart` | Restart the agent deployment |
-| `task agent-configure-llm` | Inject real LLM API key, disable mock mode |
+| `task agent-configure-llm` | Re-read `.env`, patch secret + configmap, restart the pod |
 | `task agent-use-mock` | Switch back to mock mode |
+| `task run-local` | Run the agent on your machine against the port-forwards |
+| `task send-test-alert` | POST a sample Alertmanager payload to the local agent |
 
 ### Diagnostics
 
 | Task | Description |
 |---|---|
+| `task telemetry-check` | Verify demo telemetry is reaching Prometheus, Loki and Tempo |
+| `task discover-metrics` | Show the metric and service names Prometheus actually has |
 | `task status` | Show cluster, pod, and alert state |
 | `task stop-port-forward` | Kill all port-forward processes |
 
 ## E2E Test Scenarios
 
-Five tests in `tests/e2e/`. Each test:
+Ten tests in `tests/e2e/`, grouped by fault class. Each one:
 
-1. Injects a fault into the OTEL demo
+1. Flips a flagd feature flag (or kills a pod)
 2. Waits for Prometheus to detect the issue and fire an alert
 3. Waits for Alertmanager to deliver the alert to the agent's webhook
 4. Waits for the agent to investigate and produce an RCA
-5. Asserts the RCA has a root cause, confidence > 0, and evidence
+5. Asserts the RCA has a root cause, confidence > 0, evidence — and where noted, specific **computed signals**
 
-| Test | Fault | Alert | Assertions |
+| Test | Fault | Alert | Also asserts |
 |---|---|---|---|
-| `test_latency_fault_triggers_investigation` | 2s latency on checkoutservice | `HighLatency` | RCA has root cause, confidence > 0, evidence, ≥1 hypothesis |
-| `test_latency_fault_multiple_services` | Latency on checkout + cart | `HighLatency` | Agent handles cascading alerts |
-| `test_error_rate_fault_triggers_investigation` | 50% error rate on cartservice | `HighErrorRate` | RCA produced with evidence |
-| `test_pod_crash_triggers_investigation` | Kill adservice pod | `PodRestarting` | RCA detects restart, confidence > 0 |
-| `test_agent_health_after_fault` | (after any fault) | — | Agent health endpoint returns 200 |
+| `test_cart_failure_triggers_investigation` | `cartFailure=100%` | `HighErrorRate` | `error_count` signal present |
+| `test_payment_failure_triggers_investigation` | `paymentFailure=100%` | `HighErrorRate` | non-empty causal chain |
+| `test_product_catalog_failure_triggers_investigation` | `productCatalogFailure=on` | `HighErrorRate` | `error_count` signal present |
+| `test_image_slow_load_triggers_investigation` | `imageSlowLoad=10sec` | `HighLatency` | `p95` signal present |
+| `test_shipping_slowdown_surfaces_slowest_span` | `intlShippingSlowdown=10sec` | `HighLatency` | `slowest_self_ms` signal present |
+| `test_load_spike_with_cart_errors` | `loadGeneratorVUs=50` + `cartFailure=50%` | `HighLatency` | agent picks a root cause under two faults |
+| `test_ad_high_cpu_triggers_investigation` | `adHighCpu=on` | `HighCPU` | non-HTTP fault class |
+| `test_email_memory_leak_triggers_restart` | `emailMemoryLeak=1000x` | `PodRestarting` | OOMKill detected |
+| `test_pod_crash_triggers_investigation` | `kubectl delete pod` | `PodRestarting` | restart detected |
+| `test_signals_are_computed_from_real_payloads` | `cartFailure=100%` | `HighErrorRate` | signals exist and survive JSON |
+| `test_agent_health_after_fault` | (after any fault) | — | health endpoint returns 200 |
+
+### Asserting on signals, not prose
+
+The interesting assertion is `expect_signals`. The agent computes facts from telemetry in code (`analysis.py`) and attaches them to each Evidence, and `analysis.py` is deliberately forgiving: an unrecognised payload shape falls back to a truncated dump with no signals rather than failing the investigation.
+
+That fallback is invisible in unit tests, which supply payloads of a known shape. So the e2e assertion is: after a real fault, at least one Evidence carries the expected computed key. If Tempo starts returning span attributes in a shape the parser does not know, `slowest_self_ms` disappears and `test_shipping_slowdown_surfaces_slowest_span` fails — which is the only place that failure is detectable.
 
 ### Running e2e tests manually
 
 ```bash
-cd tests/e2e
-
 # All e2e tests
 AGENT_URL=http://localhost:8080 PROMETHEUS_URL=http://localhost:9091 \
-  pytest . -v -m e2e --tb=long
+  pytest tests/e2e -v -m e2e --tb=long
 
-# Single test
-AGENT_URL=http://localhost:8080 PROMETHEUS_URL=http://localhost:9091 \
-  pytest test_latency_fault.py -v --tb=long
+# One file
+task e2e-test-one -- tests/e2e/test_latency_faults.py
 ```
 
 ### Test timeout
 
-The default timeout is 300 seconds (5 minutes). Override with `E2E_TIMEOUT`:
+The default is 300 seconds per wait; real-LLM investigations often need more. Set `E2E_TIMEOUT` in `.env` (the example ships 600) or override per run:
 
 ```bash
-E2E_TIMEOUT=600 task e2e-test
+E2E_TIMEOUT=900 task e2e-test
 ```
+
+Expect the full suite to take 30–45 minutes against a real LLM — each scenario waits out a 1-minute `for:` clause plus alert delivery plus an investigation.
 
 ## How It Works
 
@@ -225,14 +285,24 @@ open → acknowledge
 
 ### Prometheus Rules
 
-The e2e test deploys custom PrometheusRules in `deploy/monitoring/prometheus-rules.yaml`:
+`deploy/monitoring/prometheus-rules.yaml` defines two groups. Recording rules normalise the source metrics; alerts read the normalised series.
 
-| Rule | Expression | Threshold |
-|---|---|---|
-| `HighLatency` | `histogram_quantile(0.99, rate(http_server_duration_bucket[5m]))` | > 500ms P99 |
-| `HighErrorRate` | `rate(http_server_duration_count{status_code=~"5.."}[5m]) / rate(...)` | > 10% |
-| `PodRestarting` | `rate(kube_pod_container_status_restarts_total[10m])` | > 0 |
-| `HighCPU` | `rate(container_cpu_usage_seconds_total[5m]) * 100` | > 1% |
+| Recording rule | Source |
+|---|---|
+| `otel:service_latency_p99_seconds` | spanmetrics `traces_span_metrics_duration_*_bucket`, falling back to `http_server_request_duration_seconds_bucket` |
+| `otel:service_error_ratio` | spanmetrics `traces_span_metrics_calls_total` by `status_code` |
+
+The indirection is not decoration. The demo spans nine languages at different semconv versions, and the spanmetrics connector is mid-migration from milliseconds to seconds — so the source metric name is genuinely uncertain until the stack is running. The recording rule accepts whichever series exists (`or` takes the first non-empty vector). Run `task discover-metrics` to see which one is live.
+
+| Alert | Expression | Threshold | `for` |
+|---|---|---|---|
+| `HighLatency` | `otel:service_latency_p99_seconds` | > 0.5s | 1m |
+| `HighErrorRate` | `otel:service_error_ratio` | > 10% | 1m |
+| `PodRestarting` | `rate(kube_pod_container_status_restarts_total[10m])` | > 0 | 1m |
+| `HighCPU` | `rate(container_cpu_usage_seconds_total[5m])` | > 0.4 cores | 1m |
+| `PodNotReady` | `kube_pod_status_ready{condition="true"}` | == 0 | 2m |
+
+The last three read kube-state-metrics and cAdvisor rather than the demo's instrumentation, so they still fire when the OTLP pipeline is misconfigured — useful as a control.
 
 ### Alertmanager Config
 
@@ -248,31 +318,33 @@ receivers:
 
 ## Cluster Topology
 
+Service names below are from demo chart `0.41.0` (app 3.0.0), pinned in the Taskfile. Earlier majors used a `…service` suffix (`cartservice`, `checkoutservice`); the alert rules and tests are written against the current names, which is why the version is pinned rather than tracking latest.
+
 ```
 Namespace: monitoring
-  ├── kube-prometheus-stack-prometheus      (metrics scraper)
+  ├── kube-prometheus-stack-prometheus      (metrics, OTLP receiver enabled)
   ├── kube-prometheus-stack-alertmanager    (alert router → agent webhook)
-  └── kube-prometheus-stack-grafana         (dashboards, optional)
+  ├── kube-prometheus-stack-grafana         (dashboards, optional)
+  ├── loki + promtail                       (pod logs)
+  └── tempo                                 (traces; OTLP gRPC :4317, query :3200)
 
 Namespace: otel-demo
-  ├── checkoutservice                       (Go)
-  ├── cartservice                           (.NET)
-  ├── productcatalogservice                 (Go)
-  ├── currencyservice                       (C++)
-  ├── paymentservice                        (JavaScript)
-  ├── shippingservice                       (Rust)
-  ├── emailservice                          (Ruby)
-  ├── adservice                             (Java)
-  ├── frauddetectionservice                 (Kotlin)
-  ├── recommendationservice                 (Python)
-  ├── frontend                              (JavaScript)
-  ├── flagd                                 (feature flags)
-  ├── opentelemetry-collector               (telemetry pipeline)
-  └── loadgenerator                         (synthetic traffic)
+  ├── cart                (.NET)        ├── frontend        (JavaScript)
+  ├── checkout            (Go)          ├── frontend-proxy  (Envoy)
+  ├── product-catalog     (Go)          ├── image-provider  (nginx)
+  ├── currency            (C++)         ├── quote           (PHP)
+  ├── payment             (JavaScript)  ├── accounting      (.NET)
+  ├── shipping            (Rust)        ├── flagd           (feature flags)
+  ├── email               (Ruby)        ├── kafka, valkey-cart, astronomy-db
+  ├── ad                  (Java)        ├── otel-collector  (telemetry pipeline)
+  ├── fraud-detection     (Kotlin)      └── load-generator  (synthetic traffic)
+  └── recommendation      (Python)
 
 Namespace: observability-agent
   └── observability-agent                   (the agent, NodePort: 30080)
 ```
+
+The demo's `agent`, `chatbot` and `mcp` components are disabled — they are LLM demos needing their own credentials, and nothing here investigates them.
 
 ## Troubleshooting
 
@@ -302,25 +374,47 @@ kubectl get secret alertmanager-config -n monitoring -o jsonpath='{.data.alertma
 kubectl logs -n observability-agent -l app=observability-agent | grep -i alert
 ```
 
-### OTEL demo not scraping metrics
+### Demo telemetry not reaching the monitoring stack
 
-The OTEL demo Helm chart includes a ServiceMonitor. Verify Prometheus can see it:
+**Start here.** This is the failure that costs the most time, because it presents as every latency and error test timing out after five minutes — which looks like an agent bug and is not.
 
 ```bash
-kubectl get servicemonitor -n otel-demo
-curl -s http://localhost:9091/api/v1/targets | python -m json.tool | grep -A5 otel-demo
+task telemetry-check    # fails loudly if metrics, traces or logs are missing
+task discover-metrics   # shows which source metric the recording rules are using
 ```
+
+If Prometheus has no `service_name` values, the demo's collector is not exporting into it:
+
+```bash
+kubectl logs -n otel-demo -l opentelemetry.io/name=otel-collector | grep -i "export\|error"
+
+# Confirm the exporter endpoints were actually overridden
+kubectl get cm otel-collector -n otel-demo -o yaml | grep -A2 "otlp_http/prometheus\|otlp_grpc/jaeger"
+```
+
+Both should point at `…monitoring.svc.cluster.local`, not at `prometheus:9090` / `jaeger:4317`. If they still point at the chart defaults, `deploy/monitoring/otel-demo-values.yaml` was not applied — re-run `task demo`.
+
+If Tempo is empty but Prometheus has data, only the trace exporter is misrouted; the TraceAgent will return error Evidence and `slowest_self_ms` assertions will fail.
 
 ### Cluster resources exhausted
 
-The full stack (monitoring + demo + agent) needs ~4GB RAM and ~4 CPU cores. Reduce the demo footprint by disabling non-essential services:
+The full stack (monitoring + Loki + Tempo + demo + agent) needs roughly 8GB RAM and 6 CPU cores. The Taskfile starts Colima with 6 CPU / 12 GiB by default; override with `COLIMA_CPUS` and `COLIMA_MEMORY`.
+
+To shrink the demo, disable services no test touches by adding them to `deploy/monitoring/otel-demo-values.yaml`:
+
+```yaml
+components:
+  accounting: {enabled: false}
+  fraud-detection: {enabled: false}
+  quote: {enabled: false}
+```
+
+Do not disable `load-generator` — with no traffic, nothing produces telemetry and every test times out.
+
+Note that `test_email_memory_leak_triggers_restart` is deliberately an OOM. On a memory-tight machine it can evict neighbouring pods; run it on its own if the suite gets flaky:
 
 ```bash
-helm upgrade otel-demo open-telemetry/opentelemetry-demo \
-  --namespace otel-demo \
-  --set loadgenerator.enabled=false \
-  --set jaeger.enabled=false \
-  --set grafana.enabled=false
+task e2e-test-one -- tests/e2e/test_resource_faults.py
 ```
 
 ## CI/CD
@@ -340,10 +434,15 @@ jobs:
       - run: task e2e-setup
         env:
           LLM_API_KEY: ${{ secrets.LLM_API_KEY }}
+          LLM_BASE_URL: ${{ secrets.LLM_BASE_URL }}
+          LLM_MODEL: ${{ vars.LLM_MODEL }}
+      - run: task telemetry-check
       - run: task e2e-test
       - run: task teardown
         if: always()
 ```
+
+No `.env` is needed in CI — environment variables take precedence over the file, and every task reads them the same way.
 
 Unit tests (no cluster needed) run in a separate lightweight job:
 

@@ -1,0 +1,54 @@
+# opentelemetry-demo values — point the demo's collector at OUR monitoring stack.
+#
+# The chart ships its own Prometheus, Jaeger, Grafana and OpenSearch and exports to
+# them by name. We disable all four and re-target the exporters, otherwise both the
+# metrics and traces pipelines export into services that do not exist and the agent
+# has nothing to investigate.
+#
+# Logs are deliberately not exported here — Promtail already tails every pod's
+# stdout into Loki (deploy/monitoring/loki-values.yaml), which is where the
+# LogsAgent looks.
+
+# Bundled backends — replaced by kube-prometheus-stack, Tempo and Loki.
+prometheus:
+  enabled: false
+jaeger:
+  enabled: false
+grafana:
+  enabled: false
+opensearch:
+  enabled: false
+
+components:
+  # Demo 3.x ships an LLM-backed assistant that needs its own model credentials
+  # and adds three pods we never investigate. Off.
+  agent:
+    enabled: false
+  chatbot:
+    enabled: false
+  mcp:
+    enabled: false
+
+opentelemetry-collector:
+  resources:
+    requests:
+      cpu: 50m
+      memory: 128Mi
+    limits:
+      memory: 400Mi
+  config:
+    exporters:
+      # Prometheus with --web.enable-otlp-receiver; the exporter appends /v1/metrics.
+      otlp_http/prometheus:
+        endpoint: http://kube-prometheus-stack-prometheus.monitoring.svc.cluster.local:9090/api/v1/otlp
+      # Tempo speaks OTLP gRPC on 4317 — a drop-in for the chart's Jaeger exporter.
+      otlp_grpc/jaeger:
+        endpoint: tempo.monitoring.svc.cluster.local:4317
+    service:
+      pipelines:
+        # Overriding only the exporter list; receivers and processors come from
+        # the chart so upstream pipeline changes still apply.
+        logs:
+          exporters: [debug]
+        profiles:
+          exporters: [debug]

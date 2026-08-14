@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 import subprocess
@@ -18,6 +19,12 @@ AGENT_NAMESPACE = "observability-agent"
 E2E_TIMEOUT = int(os.getenv("E2E_TIMEOUT", "300"))
 POLL_INTERVAL = 5
 
+FLAGD_CONFIGMAP = "flagd-config"
+FLAGD_DEPLOYMENT = "flagd"
+FLAGD_KEY = "demo.flagd.json"
+# jsonpath treats "." as a path separator, so the dots in the key are escaped.
+FLAGD_JSONPATH = r"{.data.demo\.flagd\.json}"
+
 logger = logging.getLogger(__name__)
 
 
@@ -27,6 +34,109 @@ def kubectl(*args: str) -> str:
     if result.returncode != 0:
         raise RuntimeError(f"kubectl {' '.join(args)} failed: {result.stderr.strip()}")
     return result.stdout.strip()
+
+
+# ---------------------------------------------------------------------------
+# Fault injection via flagd feature flags
+#
+# The demo's own fault switches, so the failures are real rather than simulated.
+#
+# The flag lives in the flagd-config ConfigMap, but flagd does not read it from
+# there: an initContainer copies the file into an emptyDir at pod start, and flagd
+# watches that copy. Patching the ConfigMap alone is therefore invisible to the
+# running pod — every write has to be followed by a rollout. Roughly 15s per flag
+# change, which is noise next to the 1m `for:` clause on the alert rules.
+# ---------------------------------------------------------------------------
+
+
+def _read_flagd_config() -> dict[str, Any]:
+    raw = kubectl(
+        "get", "configmap", FLAGD_CONFIGMAP,
+        "--namespace", DEMO_NAMESPACE,
+        "-o", f"jsonpath={FLAGD_JSONPATH}",
+    )
+    if not raw:
+        raise RuntimeError(
+            f"ConfigMap {FLAGD_CONFIGMAP} in {DEMO_NAMESPACE} has no {FLAGD_KEY} key. "
+            "Is the OTEL demo deployed? Run: task demo"
+        )
+    return json.loads(raw)
+
+
+def _write_flagd_config(config: dict[str, Any]) -> None:
+    patch = json.dumps({"data": {FLAGD_KEY: json.dumps(config)}})
+    kubectl(
+        "patch", "configmap", FLAGD_CONFIGMAP,
+        "--namespace", DEMO_NAMESPACE,
+        "--type", "merge",
+        "-p", patch,
+    )
+    # Without this the patch is inert: flagd is serving the emptyDir copy its
+    # initContainer made when the pod started.
+    kubectl("rollout", "restart", f"deployment/{FLAGD_DEPLOYMENT}", "--namespace", DEMO_NAMESPACE)
+    kubectl(
+        "rollout", "status", f"deployment/{FLAGD_DEPLOYMENT}",
+        "--namespace", DEMO_NAMESPACE, "--timeout=120s",
+    )
+
+
+def list_flags() -> dict[str, str]:
+    """Map every flag in the deployed demo to its current variant."""
+    flags = _read_flagd_config()["flags"]
+    return {name: spec.get("defaultVariant", "") for name, spec in flags.items()}
+
+
+def set_flag(flag_name: str, variant: str) -> None:
+    """Set a flagd feature flag to a variant.
+
+    Raises with the available names rather than a bare KeyError — the demo renames
+    flags between majors, and a rename should read as "this flag is gone", not as a
+    mystery failure deep in a test.
+    """
+    config = _read_flagd_config()
+    flags = config["flags"]
+    if flag_name not in flags:
+        raise KeyError(
+            f"No flagd flag named {flag_name!r}. Available: {', '.join(sorted(flags))}"
+        )
+    variants = flags[flag_name].get("variants", {})
+    if variant not in variants:
+        raise KeyError(
+            f"Flag {flag_name!r} has no variant {variant!r}. "
+            f"Available: {', '.join(sorted(variants))}"
+        )
+    flags[flag_name]["defaultVariant"] = variant
+    _write_flagd_config(config)
+    logger.info("flagd: %s = %s", flag_name, variant)
+
+
+# Flags whose healthy baseline is not "off". Everything else in the demo is a fault
+# switch that defaults off; these two drive the synthetic traffic the whole harness
+# depends on, so resetting them to "off" would silence the telemetry entirely.
+BASELINE_VARIANTS = {
+    "loadGeneratorTraffic": "on",
+    "loadGeneratorVUs": "5",
+}
+
+
+def reset_flags() -> None:
+    """Return every flag to its shipped default, so a crashed test cannot leave the
+    demo broken for the next one."""
+    try:
+        config = _read_flagd_config()
+    except RuntimeError:
+        return
+    changed = False
+    for name, spec in config["flags"].items():
+        target = BASELINE_VARIANTS.get(name, "off")
+        if target not in spec.get("variants", {}):
+            continue  # a flag added upstream that we know nothing about
+        if spec.get("defaultVariant") != target:
+            spec["defaultVariant"] = target
+            changed = True
+            logger.info("flagd: reset %s -> %s", name, target)
+    if changed:
+        _write_flagd_config(config)
 
 
 def list_incident_ids() -> set[str]:
@@ -129,18 +239,40 @@ def cleanup_incidents() -> None:
         pass
 
 
-def assert_rca(incident: dict[str, Any]) -> None:
-    """Common RCA shape assertions, reusable across all test files."""
+def assert_rca(
+    incident: dict[str, Any],
+    *,
+    expect_signals: set[str] | None = None,
+) -> None:
+    """Common RCA shape assertions, reusable across all test files.
+
+    expect_signals names computed facts (analysis.py) that must appear on at least
+    one evidence item. Asserting on those rather than on the narrative is what
+    distinguishes "the agent measured this" from "the LLM wrote a plausible
+    sentence" — which is the whole point of running against real telemetry.
+    """
     rca = incident.get("rca")
     assert rca is not None, "Agent must produce an RCA"
     assert rca.get("root_cause"), "RCA must have a non-empty root_cause"
     assert rca.get("confidence", 0) > 0, "RCA confidence must be > 0"
-    assert len(rca.get("evidence", [])) > 0, "RCA must include at least one evidence item"
+    evidence = rca.get("evidence", [])
+    assert len(evidence) > 0, "RCA must include at least one evidence item"
     assert incident.get("hypothesis_count", 0) >= 1, "Investigation must evaluate at least one hypothesis"
     terminal_or_approval = {"pending_approval", "rca_produced", "resolved", "closed"}
     assert incident.get("status") in terminal_or_approval, (
         f"Expected a post-RCA status, got {incident.get('status')!r}"
     )
+
+    if expect_signals:
+        seen: set[str] = set()
+        for item in evidence:
+            seen.update(item.get("signals") or {})
+        missing = expect_signals - seen
+        assert not missing, (
+            f"Expected computed signals {sorted(missing)} on the RCA evidence, "
+            f"got {sorted(seen) or 'none'}. Sources: "
+            f"{sorted({e.get('source') for e in evidence})}"
+        )
 
 
 def check_cluster_ready() -> None:
@@ -178,3 +310,19 @@ def check_cluster_ready() -> None:
         raise RuntimeError(
             f"Agent not reachable at {AGENT_URL}. Run: task port-forward"
         ) from e
+
+    # Without demo metrics in Prometheus the latency and error rules can never
+    # fire, and every scenario fails as a five-minute timeout that looks like an
+    # agent bug. Fail fast and point at the real problem instead.
+    try:
+        with urllib.request.urlopen(
+            f"{PROMETHEUS_URL}/api/v1/label/service_name/values", timeout=10
+        ) as resp:
+            services = json.load(resp).get("data") or []
+    except Exception as e:
+        raise RuntimeError(f"Prometheus not reachable at {PROMETHEUS_URL}") from e
+    if not services:
+        raise RuntimeError(
+            "Prometheus has no service_name label values — the demo's collector is "
+            "not exporting into kube-prometheus-stack. Run: task telemetry-check"
+        )

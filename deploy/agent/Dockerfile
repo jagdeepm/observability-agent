@@ -3,14 +3,14 @@ FROM python:3.12-slim
 
 WORKDIR /app
 
-# Install only runtime deps
-COPY pyproject.toml .
-RUN pip install --no-cache-dir -e ".[dev]" 2>/dev/null || true
+# Dependencies first, against a stub package, so editing src/ does not re-download
+# pydantic-ai on every `task agent-build`.
+COPY pyproject.toml ./
+RUN mkdir -p src/observability_agent \
+    && touch src/observability_agent/__init__.py \
+    && pip install --no-cache-dir -e .
 
-# Copy source
 COPY src/ src/
-
-# Install the package
 RUN pip install --no-cache-dir -e .
 
 # Use the entry point from pyproject.toml

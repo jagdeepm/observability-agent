@@ -5,10 +5,15 @@ metadata:
   name: agent-config
   namespace: observability-agent
 data:
-  # LLM provider — set to "false" for real LLM, "true" for mock responses
+  # LLM_MOCK and LLM_MODEL are overwritten at deploy time by `task llm-config`,
+  # which reads them from .env. These are the values used if you apply this file
+  # by hand. LLM_API_KEY and LLM_BASE_URL come from the agent-secrets Secret.
+  #
+  # LLM_MOCK=true here is a trap: it swaps in a MockLLMProvider with no registered
+  # responses while leaving the real agents wired up, so every agent call raises.
+  # For an offline run, pass `serve --mock-llm` instead — that swaps the agents too.
   LLM_MOCK: "false"
   LLM_MODEL: "openai:gpt-4o"
-  # LLM_API_KEY and LLM_BASE_URL come from the agent-secrets Secret
   MAX_CONCURRENT_INVESTIGATIONS: "3"
   STALE_THRESHOLD_HOURS: "1"
   # Observability source endpoints

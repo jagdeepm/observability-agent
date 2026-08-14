@@ -13,10 +13,17 @@
 #   task runtime-status   # Show which runtime is active
 #
 # LLM configuration:
-#   export LLM_API_KEY="sk-..." && task all              # Real LLM
-#   task all                                              # Mock LLM (no API key needed)
+#   cp .env.example .env && $EDITOR .env                 # LiteLLM proxy URL + key
+#   task all                                              # picks .env up automatically
+#
+# Without an LLM_API_KEY the agent is deployed in mock mode (`serve --mock-llm`),
+# which uses canned responses and needs no network.
 
 version: '3'
+
+# Loaded into every task's environment. A variable already exported in the shell
+# takes precedence, so `export LLM_API_KEY=... && task all` still works.
+dotenv: ['.env']
 
 vars:
   CLUSTER_NAME: observability-e2e
@@ -24,6 +31,10 @@ vars:
   AGENT_NS: observability-agent
   DEMO_NS: otel-demo
   AGENT_IMAGE: observability-agent:local
+  # Pinned — the demo renames services and feature flags between majors, and the
+  # e2e tests and alert rules are written against this version (app 3.0.0).
+  DEMO_CHART_VERSION: '{{.DEMO_CHART_VERSION | default "0.41.0"}}'
+  TEMPO_CHART_VERSION: '{{.TEMPO_CHART_VERSION | default "1.24.4"}}'
   # Colima resource defaults — tune for your machine
   COLIMA_CPUS: '{{.COLIMA_CPUS | default 6}}'
   COLIMA_MEMORY: '{{.COLIMA_MEMORY | default 12}}'
@@ -35,12 +46,13 @@ vars:
 
 tasks:
   all:
-    desc: Full pipeline — runtime, cluster, monitoring, loki, demo, agent, e2e tests
+    desc: Full pipeline — runtime, cluster, monitoring, loki, tempo, demo, agent, e2e tests
     cmds:
       - task: runtime-start
       - task: cluster
       - task: monitoring
       - task: loki
+      - task: tempo
       - task: demo
       - task: agent-build
       - task: agent-deploy
@@ -54,10 +66,22 @@ tasks:
       - task: cluster
       - task: monitoring
       - task: loki
+      - task: tempo
       - task: demo
       - task: agent-build
       - task: agent-deploy
       - task: port-forward
+
+  env-init:
+    desc: Create .env from .env.example if it does not exist
+    cmds:
+      - |
+        if [ -f .env ]; then
+          echo ".env already exists — leaving it alone"
+        else
+          cp .env.example .env
+          echo "Created .env — fill in LLM_BASE_URL, LLM_API_KEY and LLM_MODEL"
+        fi
 
   # -------------------------------------------------------------------------
   # Runtime (Colima / Docker Desktop)
@@ -212,6 +236,26 @@ tasks:
           -p '{"data":{"loki-stack-datasource.yaml":"apiVersion: 1\ndatasources:\n- name: Loki\n  type: loki\n  access: proxy\n  url: \"http://loki:3100\"\n  version: 1\n  isDefault: false\n  jsonData:\n    {}\n"}}' 2>/dev/null || true
         echo "Loki ready — logs available in Grafana under the Loki datasource"
 
+  tempo:
+    desc: Deploy Tempo (trace backend for the TraceAgent)
+    deps: [cluster]
+    cmds:
+      - |
+        helm repo add grafana https://grafana.github.io/helm-charts 2>/dev/null || true
+        helm repo update grafana
+        kubectl create ns {{.MONITORING_NS}} --dry-run=client -o yaml | kubectl apply -f -
+      - |
+        echo "Deploying Tempo {{.TEMPO_CHART_VERSION}}..."
+        helm upgrade --install tempo grafana/tempo \
+          --namespace {{.MONITORING_NS}} \
+          --version {{.TEMPO_CHART_VERSION}} \
+          --values deploy/monitoring/tempo-values.yaml \
+          --wait --timeout 5m
+      - |
+        kubectl wait --for=condition=Ready pods -n {{.MONITORING_NS}} \
+          -l app.kubernetes.io/name=tempo --timeout=120s || true
+        echo "Tempo ready — query API on tempo.{{.MONITORING_NS}}:3200, OTLP gRPC on :4317"
+
   # -------------------------------------------------------------------------
   # OpenTelemetry Demo
   # -------------------------------------------------------------------------
@@ -222,19 +266,16 @@ tasks:
     cmds:
       - |
         helm repo add open-telemetry https://open-telemetry.github.io/opentelemetry-helm-charts 2>/dev/null || true
-        helm repo update
+        helm repo update open-telemetry
         kubectl create ns {{.DEMO_NS}} --dry-run=client -o yaml | kubectl apply -f -
 
       - |
-        echo "Deploying OTEL demo..."
+        echo "Deploying OTEL demo {{.DEMO_CHART_VERSION}}..."
         helm upgrade --install otel-demo open-telemetry/opentelemetry-demo \
           --namespace {{.DEMO_NS}} \
-          --set opentelemetry-collector.resources.requests.cpu=50m \
-          --set opentelemetry-collector.resources.requests.memory=128Mi \
-          --set prometheus.enabled=false \
-          --set jaeger.enabled=false \
-          --set grafana.enabled=false \
-          --wait --timeout 10m
+          --version {{.DEMO_CHART_VERSION}} \
+          --values deploy/monitoring/otel-demo-values.yaml \
+          --wait --timeout 15m
 
       - |
         echo "Waiting for OTEL demo pods..."
@@ -260,6 +301,7 @@ tasks:
       - kubectl apply -f deploy/agent/namespace.yaml
       - kubectl apply -f deploy/agent/rbac.yaml
       - kubectl apply -f deploy/agent/configmap.yaml
+      - task: llm-config
       - |
         kubectl create secret generic agent-secrets \
           --namespace {{.AGENT_NS}} \
@@ -275,13 +317,35 @@ tasks:
         echo "Agent pods:"
         kubectl get pods -n {{.AGENT_NS}}
 
-  agent-configure-llm:
-    desc: Configure the agent with a real LLM API key and disable mock mode
+  llm-config:
+    desc: Push LLM_MODEL / LLM_MOCK from the environment (.env) into the agent ConfigMap
     cmds:
       - |
-        if [ -z "${LLM_API_KEY}" ]; then
+        # LLM_MODEL is hardcoded in configmap.yaml; without this patch a model name
+        # from .env would never reach the pod.
+        #
+        # LLM_MOCK is derived from the key rather than read from .env on purpose:
+        # LLM_MOCK=true in-cluster gives real agents wired to a MockLLMProvider with
+        # no registered responses, so every agent call raises KeyError. Mock mode is
+        # only meaningful via `serve --mock-llm`, which swaps the agents out too.
+        if [ -n "${LLM_API_KEY:-}" ]; then MOCK=false; else MOCK=true; fi
+        kubectl patch configmap agent-config -n {{.AGENT_NS}} --type merge -p "$(
+          printf '{"data":{"LLM_MODEL":"%s","LLM_MOCK":"%s"}}' "${LLM_MODEL:-openai:gpt-4o}" "$MOCK"
+        )"
+        if [ "$MOCK" = "true" ]; then
+          echo "No LLM_API_KEY found — agent will start in mock mode."
+          echo "  Set LLM_BASE_URL / LLM_API_KEY / LLM_MODEL in .env (see .env.example)."
+        else
+          echo "LLM: ${LLM_MODEL:-openai:gpt-4o} via ${LLM_BASE_URL:-the provider default}"
+        fi
+
+  agent-configure-llm:
+    desc: Re-read .env, push the LLM key/model to the running agent, and restart it
+    cmds:
+      - |
+        if [ -z "${LLM_API_KEY:-}" ]; then
           echo "ERROR: LLM_API_KEY is not set."
-          echo "Usage: export LLM_API_KEY=sk-... && task agent-configure-llm"
+          echo "Run 'task env-init' and fill in .env, or export LLM_API_KEY=sk-..."
           exit 1
         fi
       - |
@@ -290,14 +354,11 @@ tasks:
           --from-literal=LLM_API_KEY="${LLM_API_KEY}" \
           --from-literal=LLM_BASE_URL="${LLM_BASE_URL:-}" \
           --dry-run=client -o yaml | kubectl apply -f -
-      - |
-        kubectl patch configmap agent-config -n {{.AGENT_NS}} -p '{"data": {"LLM_MOCK": "false"}}'
+      - task: llm-config
       - |
         kubectl rollout restart deployment/observability-agent -n {{.AGENT_NS}}
       - |
-        kubectl wait --for=condition=Ready pods -n {{.AGENT_NS}} -l app=observability-agent --timeout=60s
-      - |
-        echo "Agent configured with real LLM. Model: ${LLM_MODEL:-openai:gpt-4o}"
+        kubectl rollout status deployment/observability-agent -n {{.AGENT_NS}} --timeout=120s
 
   agent-use-mock:
     desc: Switch the agent back to mock mode (no LLM API key needed)
@@ -310,6 +371,61 @@ tasks:
         kubectl wait --for=condition=Ready pods -n {{.AGENT_NS}} -l app=observability-agent --timeout=60s
       - |
         echo "Agent switched to mock mode"
+
+  # -------------------------------------------------------------------------
+  # Local run — the agent on this machine, against port-forwarded backends.
+  # No image rebuild, so LLM/prompt changes are a restart away instead of a
+  # docker build + kind load + rollout.
+  # -------------------------------------------------------------------------
+
+  run-local:
+    desc: Run the agent locally against port-forwarded backends (needs task port-forward)
+    cmds:
+      - |
+        if [ -z "${LLM_API_KEY:-}" ]; then
+          echo "ERROR: LLM_API_KEY is not set. Run 'task env-init' and fill in .env."
+          exit 1
+        fi
+        echo "Agent on http://127.0.0.1:8081"
+        echo "  Prometheus: ${PROMETHEUS_URL:-http://localhost:9091}"
+        echo "  Loki:       ${LOKI_URL:-http://localhost:3100}"
+        echo "  Tempo:      ${TEMPO_URL:-http://localhost:3200}"
+        echo "  LLM:        ${LLM_MODEL:-openai:gpt-4o} via ${LLM_BASE_URL:-provider default}"
+        PROMETHEUS_URL="${PROMETHEUS_URL:-http://localhost:9091}" \
+        LOKI_URL="${LOKI_URL:-http://localhost:3100}" \
+        TEMPO_URL="${TEMPO_URL:-http://localhost:3200}" \
+        observability-agent serve --host 127.0.0.1 --port 8081
+
+  send-test-alert:
+    desc: POST a sample Alertmanager payload to the local agent (task run-local)
+    vars:
+      SERVICE: '{{.SERVICE | default "cart"}}'
+      ALERTNAME: '{{.ALERTNAME | default "HighErrorRate"}}'
+    cmds:
+      - |
+        # Alertmanager in the cluster cannot reach your laptop, so the local agent
+        # is fed by hand.
+        curl -sS -X POST http://127.0.0.1:8081/alerts \
+          -H 'Content-Type: application/json' \
+          -d '{
+                "status": "firing",
+                "alerts": [{
+                  "status": "firing",
+                  "labels": {
+                    "alertname": "{{.ALERTNAME}}",
+                    "service": "{{.SERVICE}}",
+                    "namespace": "{{.DEMO_NS}}",
+                    "severity": "critical",
+                    "cluster": "kind-e2e"
+                  },
+                  "annotations": {
+                    "summary": "{{.SERVICE}} error rate > 10%",
+                    "description": "Sent by task send-test-alert"
+                  },
+                  "fingerprint": "local-test-{{.SERVICE}}"
+                }]
+              }' | python3 -m json.tool
+        echo "Watch: curl -s http://127.0.0.1:8081/incidents | python3 -m json.tool"
 
   agent-logs:
     desc: Stream agent logs
@@ -330,26 +446,34 @@ tasks:
     cmds:
       - |
         echo "Starting port-forwards..."
-        for port in 8080 9090 9091; do
+        for port in 8080 9090 9091 3100 3200; do
           lsof -ti:$port 2>/dev/null | xargs kill -9 2>/dev/null && echo "  Freed port $port" || true
         done
         kubectl port-forward -n {{.AGENT_NS}} svc/observability-agent 8080:8000 &
         echo $! > /tmp/agent-port-forward.pid
-        kubectl port-forward -n {{.DEMO_NS}} svc/otel-demo-frontend 9090:8080 2>/dev/null &
+        kubectl port-forward -n {{.DEMO_NS}} svc/frontend-proxy 9090:8080 2>/dev/null &
         echo $! > /tmp/demo-port-forward.pid
         kubectl port-forward -n {{.MONITORING_NS}} svc/kube-prometheus-stack-prometheus 9091:9090 2>/dev/null &
         echo $! > /tmp/prometheus-port-forward.pid
+        kubectl port-forward -n {{.MONITORING_NS}} svc/loki 3100:3100 2>/dev/null &
+        echo $! > /tmp/loki-port-forward.pid
+        kubectl port-forward -n {{.MONITORING_NS}} svc/tempo 3200:3200 2>/dev/null &
+        echo $! > /tmp/tempo-port-forward.pid
         echo "Port-forwards started:"
         echo "  Agent API:    http://localhost:8080"
         echo "  Demo:         http://localhost:9090"
         echo "  Prometheus:   http://localhost:9091"
+        echo "  Loki:         http://localhost:3100"
+        echo "  Tempo:        http://localhost:3200"
         sleep 2
 
   stop-port-forward:
     desc: Stop all port-forwards
     cmds:
       - |
-        for f in /tmp/agent-port-forward.pid /tmp/demo-port-forward.pid /tmp/prometheus-port-forward.pid; do
+        for f in /tmp/agent-port-forward.pid /tmp/demo-port-forward.pid \
+                 /tmp/prometheus-port-forward.pid /tmp/loki-port-forward.pid \
+                 /tmp/tempo-port-forward.pid; do
           if [ -f "$f" ]; then
             kill $(cat "$f") 2>/dev/null || true
             rm "$f"
@@ -361,27 +485,30 @@ tasks:
   # Fault injection
   # -------------------------------------------------------------------------
 
-  inject-latency:
-    desc: Trigger high latency on checkoutservice
+  inject-fault:
+    desc: 'Flip a flagd feature flag. Usage: task inject-fault -- cartFailure 100%'
     cmds:
       - |
-        echo "Triggering latency fault on checkoutservice..."
-        kubectl exec -n {{.DEMO_NS}} deploy/checkoutservice -- sh -c "echo 'Simulating latency...'" || true
+        # Same code path the e2e tests use, so a flag rename breaks both at once.
+        python3 -c 'import sys; from tests.e2e.helpers import set_flag; set_flag(*sys.argv[1:])' {{.CLI_ARGS}}
         echo "Check alerts: http://localhost:9091/api/v1/alerts"
 
-  inject-error:
-    desc: Trigger errors on cartservice
+  list-faults:
+    desc: List the flagd feature flags available in the deployed demo
     cmds:
-      - |
-        echo "Triggering error fault on cartservice..."
-        kubectl exec -n {{.DEMO_NS}} deploy/cartservice -- sh -c "echo 'Simulating errors...'" || true
-        echo "Check alerts: http://localhost:9091/api/v1/alerts"
+      - python3 -c 'from tests.e2e.helpers import list_flags; [print(f"{k:28} {v}") for k, v in list_flags().items()]'
+
+  reset-faults:
+    desc: Return every flagd flag to its shipped default
+    cmds:
+      - python3 -c 'from tests.e2e.helpers import reset_flags; reset_flags()'
+      - echo "All flags reset"
 
   inject-crash:
-    desc: Kill a pod to trigger restart detection
+    desc: Kill an ad pod to trigger restart detection
     cmds:
       - |
-        POD=$(kubectl get pods -n {{.DEMO_NS}} -l app=adservice -o jsonpath='{.items[0].metadata.name}')
+        POD=$(kubectl get pods -n {{.DEMO_NS}} -l app.kubernetes.io/name=ad -o jsonpath='{.items[0].metadata.name}')
         echo "Deleting pod: $POD"
         kubectl delete pod -n {{.DEMO_NS}} "$POD"
         echo "Check alerts: http://localhost:9091/api/v1/alerts"
@@ -397,19 +524,75 @@ tasks:
         echo "Running e2e tests..."
         AGENT_URL=http://localhost:8080 \
         PROMETHEUS_URL=http://localhost:9091 \
-        python -m pytest tests/e2e/ -v -m e2e --tb=long --timeout={{.E2E_TIMEOUT | default 600}}
+        python -m pytest tests/e2e/ -v -m e2e --tb=long --timeout={{.E2E_TIMEOUT | default 900}}
 
-  e2e-test-latency:
-    desc: Run only the latency fault e2e test
+  e2e-test-one:
+    desc: 'Run a subset of the e2e tests. Usage: task e2e-test-one -- tests/e2e/test_error_faults.py'
     cmds:
       - |
         AGENT_URL=http://localhost:8080 \
         PROMETHEUS_URL=http://localhost:9091 \
-        python -m pytest tests/e2e/test_latency_fault.py -v --tb=long
+        python -m pytest {{.CLI_ARGS}} -v -m e2e --tb=long --timeout={{.E2E_TIMEOUT | default 900}}
 
   # -------------------------------------------------------------------------
   # Smoke test
   # -------------------------------------------------------------------------
+
+  telemetry-check:
+    desc: Verify demo telemetry is actually reaching Prometheus, Loki and Tempo
+    cmds:
+      - |
+        # The single most useful diagnostic: if the demo's collector is not
+        # exporting into our stack, the latency and error alerts can never fire
+        # and every e2e test times out for reasons that look like agent bugs.
+        fail=0
+        echo "=== Prometheus: demo services reporting ==="
+        svcs=$(curl -s 'http://localhost:9091/api/v1/label/service_name/values' \
+          | python3 -c 'import json,sys; print(" ".join(json.load(sys.stdin).get("data") or []))' 2>/dev/null)
+        if [ -z "$svcs" ]; then
+          echo "  NONE — demo metrics are not reaching Prometheus."
+          echo "  Check: kubectl logs -n {{.DEMO_NS}} -l opentelemetry.io/name=otel-collector | grep -i export"
+          fail=1
+        else
+          echo "  $svcs"
+        fi
+
+        echo "=== Prometheus: HTTP server duration metric ==="
+        curl -s 'http://localhost:9091/api/v1/label/__name__/values' \
+          | python3 -c 'import json,sys; print("\n".join("  "+m for m in json.load(sys.stdin).get("data") or [] if "http_server" in m)) or None' 2>/dev/null \
+          || { echo "  none found"; fail=1; }
+
+        echo "=== Tempo: traces present ==="
+        n=$(curl -s 'http://localhost:3200/api/search?limit=5' \
+          | python3 -c 'import json,sys; print(len(json.load(sys.stdin).get("traces") or []))' 2>/dev/null || echo 0)
+        [ "$n" -gt 0 ] && echo "  $n traces" || { echo "  NONE — check the otlp_grpc/jaeger exporter endpoint"; fail=1; }
+
+        echo "=== Loki: labels present ==="
+        curl -s 'http://localhost:3100/loki/api/v1/labels' \
+          | python3 -c 'import json,sys; d=json.load(sys.stdin).get("data") or []; print("  "+", ".join(d) if d else "  NONE")' 2>/dev/null \
+          || { echo "  Loki not reachable"; fail=1; }
+
+        echo ""
+        [ $fail -eq 0 ] && echo "Telemetry is flowing." || { echo "Telemetry is NOT flowing — fix this before running e2e tests."; exit 1; }
+
+  discover-metrics:
+    desc: Show the metric names and service names Prometheus actually has
+    cmds:
+      - |
+        # The alert rules in deploy/monitoring/prometheus-rules.yaml normalise over
+        # several possible source metrics. Use this to see which one is live.
+        echo "=== Latency/error source metrics present ==="
+        curl -s 'http://localhost:9091/api/v1/label/__name__/values' \
+          | python3 -c 'import json,sys; [print("  "+m) for m in json.load(sys.stdin).get("data") or [] if "span_metrics" in m or "http_server" in m]'
+        echo "=== service_name values ==="
+        curl -s 'http://localhost:9091/api/v1/label/service_name/values' \
+          | python3 -c 'import json,sys; [print("  "+m) for m in json.load(sys.stdin).get("data") or []]'
+        echo "=== recording rules evaluating ==="
+        for r in otel:service_latency_p99_seconds otel:service_error_ratio; do
+          echo "  $r:"
+          curl -s --get 'http://localhost:9091/api/v1/query' --data-urlencode "query=$r" \
+            | python3 -c 'import json,sys; d=json.load(sys.stdin)["data"]["result"]; [print(f"    {s[\"metric\"].get(\"service_name\",\"?\"):20} {s[\"value\"][1]}") for s in d] or print("    (empty)")'
+        done
 
   smoke-test:
     desc: Quick smoke test — verify all components are reachable

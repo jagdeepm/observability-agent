@@ -16,6 +16,11 @@ prometheus:
     evaluationInterval: 15s
     # Accept OTLP push from the otel-demo collector (POST /api/v1/otlp/v1/metrics)
     enableOTLPReceiver: true
+    # OTLP is a push protocol, so samples arrive in whatever order the collector's
+    # batches land. Without an out-of-order window Prometheus silently drops the
+    # late ones, which shows up as gaps in exactly the series the alerts read.
+    tsdb:
+      outOfOrderTimeWindow: 30m
     # Don't require persistent volumes on Kind
     storageSpec:
       volumeClaimTemplate:
