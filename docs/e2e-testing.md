@@ -121,7 +121,7 @@ task llm-models    # list the model names the endpoint offers
 
 The third check is the one that matters. The agent never asks for free text — every call goes through `generate_structured` with a Pydantic schema, which needs tool calling or JSON-schema support all the way through the proxy to the model. An endpoint can answer `/v1/models` happily and still be unusable here.
 
-It also flags a slow endpoint: an investigation makes anywhere from ten to over a hundred calls depending on how wide the hypothesis tree grows (see "Known limitations" below), so anything over ~20s per call needs a raised `E2E_TIMEOUT`.
+It also flags a slow endpoint: an investigation makes roughly ten to a few dozen calls depending on how wide the hypothesis tree grows within its cap (see "Known limitations" below), so anything over ~20s per call needs a raised `E2E_TIMEOUT`.
 
 ### Switching modes on a running cluster
 
@@ -269,11 +269,13 @@ Expect the full suite to take well over an hour against a real LLM — each scen
 
 ## Known limitations
 
-**Hypothesis breadth has no cap.** `MAX_DEPTH` bounds how deep the tree grows (3 levels), but nothing bounds how *wide* it gets at each level — that's entirely up to what the LLM proposes. Evidence gathering across a level runs concurrently (`_gather_targeted_evidence` in `coordinator/engine.py`, mirroring the exploratory-evidence phase), which cut typical investigation time roughly 10× — a cart-failure investigation that previously took 20–40 minutes now completes in ~4 minutes in the common case. But the batch hypothesis-evaluation call is a single LLM request whose prompt size scales with hypothesis count, and that one isn't parallelized. A run where the model proposes unusually widely — observed reaching 100+ hypotheses — can still take upward of 10 minutes, making genuine progress the whole time rather than hanging.
+**Hypothesis breadth is now capped** (`docs/specs/investigation-cost-guardrails.md`) — `MAX_HYPOTHESES_PER_GENERATE`, `MAX_CHILDREN_PER_DEEPEN`, and `MAX_DEEPEN_PER_LEVEL` in `coordinator/engine.py`, next to the existing `MAX_DEPTH`. Worst case across three depth levels is now roughly 53 hypotheses, down from the 100–200+ observed uncapped. When there are more confirmed leaves than the level allows, only the most-confident ones get deepened — that selection is what actually bounds cost, since a deepen call happens once per leaf rather than in a single batch. This has not yet been re-measured against a live cluster; `E2E_TIMEOUT` stays at 1800s until it has.
 
-If e2e runs are consistently slow, capping hypotheses per level (analogous to `MAX_DEPTH`) is the next real fix — it bounds both the evidence-gathering fan-out and the evaluate-batch prompt size. Left as a follow-up: it's a coordinator design decision (what to do with the hypotheses a cap drops) rather than a mechanical change, and deserves its own tests.
+Evidence gathering across a level also runs concurrently (`_gather_targeted_evidence`, mirroring the exploratory-evidence phase), which independently cut typical investigation time roughly 10× — a cart-failure investigation that previously took 20–40 minutes completed in ~4 minutes in the common case even before the breadth cap landed.
 
-**Every LLM call has a 120-second timeout** (`PydanticAIProvider`, `infrastructure/llm_provider.py`) as a backstop against a stalled proxy — a call that never returns fails cleanly instead of hanging an investigation forever. This bounds any single call; it doesn't bound how many calls a wide investigation makes.
+**Every LLM call has a 120-second timeout** (`PydanticAIProvider`, `infrastructure/llm_provider.py`) as a backstop against a stalled proxy — a call that never returns fails cleanly instead of hanging an investigation forever.
+
+**An optional cumulative token budget** (`LLM_TOKEN_BUDGET_DAILY` / `LLM_TOKEN_BUDGET_WEEKLY` in `.env`) bounds total spend independent of any single investigation's size — see `docs/specs/investigation-cost-guardrails.md`, Part 2. Unset by default. In-memory only: it resets on pod restart, a deliberate limitation stated in the spec rather than fixed.
 
 ## How It Works
 

@@ -162,6 +162,18 @@ class AlertReceiver:
         return f"{service}: {alertname}"
 
 
+def _llm_budget_status(scheduler: Any) -> dict[str, Any] | None:
+    """The Scheduler's configured LLMProvider's token-budget snapshot, or None.
+
+    Duck-typed and optional: MockLLMProvider has no budget_status, so a
+    mock-LLM deployment (or one with no scheduler at all) gets None here and
+    /health omits the key entirely, rather than showing a null placeholder.
+    """
+    llm = getattr(getattr(scheduler, "coordinator", None), "llm", None)
+    budget_status = getattr(llm, "budget_status", None)
+    return budget_status() if budget_status is not None else None
+
+
 def create_app(
     repo: IncidentRepository,
     scheduler: Any = None,
@@ -171,11 +183,15 @@ def create_app(
     receiver = AlertReceiver(repo=repo, scheduler=scheduler)
 
     async def health(request: Request) -> JSONResponse:
-        return JSONResponse({
+        payload: dict[str, Any] = {
             "status": "ok",
             "queue_size": scheduler.queue_size if scheduler else 0,
             "running": scheduler.running_count if scheduler else 0,
-        })
+        }
+        budget = _llm_budget_status(scheduler)
+        if budget is not None:
+            payload["llm_budget"] = budget
+        return JSONResponse(payload)
 
     async def list_incidents(request: Request) -> JSONResponse:
         incidents = await repo.list_active()

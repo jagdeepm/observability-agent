@@ -7,6 +7,14 @@ from typing import Any, Protocol, runtime_checkable
 
 from pydantic import BaseModel
 
+from observability_agent.infrastructure.llm_budget import TokenBudget
+
+
+def _env_int(name: str) -> int | None:
+    """Read an optional positive integer env var. Unset or blank -> None."""
+    raw = os.getenv(name, "").strip()
+    return int(raw) if raw else None
+
 
 @runtime_checkable
 class LLMProvider(Protocol):
@@ -30,6 +38,10 @@ class PydanticAIProvider:
         LLM_MODEL: model identifier (default: "openai:gpt-4o")
         LLM_API_KEY: API key for the provider
         LLM_BASE_URL: base URL for OpenAI-compatible endpoints
+        LLM_TOKEN_BUDGET_DAILY / LLM_TOKEN_BUDGET_WEEKLY: optional cumulative
+            token ceilings — see docs/specs/investigation-cost-guardrails.md.
+            Unset by default, so installing this does not silently start
+            rejecting calls in an existing deployment.
     """
 
     def __init__(
@@ -37,6 +49,7 @@ class PydanticAIProvider:
         model: str | None = None,
         api_key: str | None = None,
         base_url: str | None = None,
+        budget: TokenBudget | None = None,
     ) -> None:
         from pydantic_ai.models.openai import OpenAIChatModel
         from pydantic_ai.providers.openai import OpenAIProvider
@@ -44,6 +57,14 @@ class PydanticAIProvider:
         model = model or os.getenv("LLM_MODEL", "openai:gpt-4o")
         api_key = api_key or os.getenv("LLM_API_KEY", "")
         base_url = base_url or os.getenv("LLM_BASE_URL", "")
+        # Env-var fallback lives here rather than in create_llm_provider, same
+        # as model/api_key/base_url just above — one place resolves this
+        # class's configuration, and `budget=` stays the seam a test injects
+        # through, exactly like the other three.
+        self._budget = budget or TokenBudget(
+            daily_limit=_env_int("LLM_TOKEN_BUDGET_DAILY"),
+            weekly_limit=_env_int("LLM_TOKEN_BUDGET_WEEKLY"),
+        )
 
         # Parse model name:
         # - "openai:gpt-4o" -> "gpt-4o" (standard format)
@@ -92,6 +113,10 @@ class PydanticAIProvider:
     ) -> BaseModel:
         from pydantic_ai import Agent
 
+        # Checked before the network call, not after — a budget already at
+        # zero costs nothing further to enforce.
+        self._budget.raise_if_exceeded()
+
         agent = Agent(
             self._model,
             system_prompt=system_prompt,
@@ -101,7 +126,13 @@ class PydanticAIProvider:
             output_type=output_schema,
             retries=max_retries,
         )
+        usage = result.usage
+        self._budget.record(usage.input_tokens, usage.output_tokens)
         return result.output
+
+    def budget_status(self) -> dict[str, dict[str, int | None]]:
+        """Used/limit for each budget window — for /health. Never raises."""
+        return self._budget.status()
 
 
 def create_llm_provider(

@@ -30,10 +30,16 @@ def format_evidence(evidence: Evidence) -> str:
 def generate_hypotheses_prompt(
     alert_labels: dict[str, str],
     exploratory_evidence: list[Evidence],
+    max_count: int,
 ) -> tuple[str, str]:
     """Build prompt for the hypothesis generation step.
 
     Context: alert labels + exploratory evidence summaries and computed signals.
+
+    max_count is a request, not a guarantee — the Coordinator truncates the
+    result defensively regardless of what comes back. Asking for it here is
+    what saves the tokens a well-behaved model would otherwise spend
+    generating hypotheses that get discarded anyway.
     """
     evidence_text = "\n".join(format_evidence(e) for e in exploratory_evidence)
     if not evidence_text:
@@ -47,6 +53,7 @@ Exploratory evidence gathered so far:
 
 Based on this evidence, propose root-cause hypotheses. Each hypothesis should be a specific, testable statement.
 Group related hypotheses under a common parent. Start with broad hypotheses, then add child hypotheses for specifics.
+Propose at most {max_count} hypotheses in total, prioritizing the most likely causes.
 
 Return a structured output with your hypotheses."""
     return SYSTEM_PROMPT, user_prompt
@@ -83,10 +90,13 @@ def deepen_hypotheses_prompt(
     hypothesis: Hypothesis,
     ancestor_chain: list[Hypothesis],
     evidence_summaries: list[str],
+    max_count: int,
 ) -> tuple[str, str]:
     """Build prompt for generating child hypotheses from a confirmed parent.
 
     Context: the confirmed hypothesis, its ancestor chain, and its evidence.
+
+    max_count is a request, not a guarantee — see generate_hypotheses_prompt.
     """
     chain_text = " → ".join(h.statement for h in ancestor_chain)
     evidence_text = "\n".join(f"- {s}" for s in evidence_summaries)
@@ -101,7 +111,7 @@ Supporting evidence:
 {evidence_text}
 
 Now drill deeper. What could be causing {hypothesis.statement}?
-Propose child hypotheses that explain the mechanism behind this confirmed finding.
+Propose at most {max_count} child hypotheses that explain the mechanism behind this confirmed finding.
 Each child should be more specific than its parent — move from "what" to "why" or "how".
 
 Return a structured output with child hypotheses."""

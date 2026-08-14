@@ -493,6 +493,46 @@ def test_flag_stale():
 
 
 # ---------------------------------------------------------------------------
+# LLM budget exceeded — spec: docs/specs/investigation-cost-guardrails.md
+# ---------------------------------------------------------------------------
+
+
+def test_flag_budget_exceeded():
+    inc = Incident(cluster_id="us-east-1", title="Test")
+    inc.acknowledge()
+    assert not inc.llm_budget_exceeded
+
+    inc.flag_budget_exceeded()
+
+    assert inc.llm_budget_exceeded
+    assert inc.budget_exceeded_flagged_at is not None
+
+
+def test_flag_budget_exceeded_is_distinct_from_stale():
+    """A human reading the incident later should be able to tell the two
+    causes apart — 'ran out of budget' is not 'took too long'."""
+    inc = Incident(cluster_id="us-east-1", title="Test")
+    inc.acknowledge()
+
+    inc.flag_budget_exceeded()
+
+    assert inc.llm_budget_exceeded
+    assert not inc.is_stale
+    assert inc.stale_flagged_at is None
+
+
+def test_flag_budget_exceeded_logs_a_distinct_reason():
+    inc = Incident(cluster_id="us-east-1", title="Test")
+    inc.acknowledge()
+
+    inc.flag_budget_exceeded()
+
+    note = inc.audit_log[-1].note
+    assert "budget" in note.lower()
+    assert "time threshold" not in note.lower()
+
+
+# ---------------------------------------------------------------------------
 # Audit log
 # ---------------------------------------------------------------------------
 

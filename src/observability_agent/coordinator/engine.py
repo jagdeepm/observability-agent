@@ -23,6 +23,7 @@ from observability_agent.coordinator.outputs import (
     DeepenHypothesesOutput,
     EvaluateHypothesesOutput,
     GenerateHypothesesOutput,
+    HypothesisProposal,
     RCAOutput,
 )
 from observability_agent.coordinator import prompts
@@ -41,6 +42,18 @@ logger = logging.getLogger(__name__)
 
 # ponytail: global default, configurable per-deployment if needed
 MAX_DEPTH = 3
+
+# Breadth caps — the same shape of decision as MAX_DEPTH, made for breadth
+# instead of depth. A real LLM does not share a mock's restraint: asked to
+# "propose hypotheses" or "drill deeper" with no count given, a live run
+# reached 177 hypotheses with no ceiling anywhere. Growth compounds across
+# MAX_DEPTH levels, so worst-case total is roughly
+# MAX_HYPOTHESES_PER_GENERATE + MAX_DEPTH * (MAX_DEEPEN_PER_LEVEL *
+# MAX_CHILDREN_PER_DEEPEN) — with these values, 8 + 3*(5*3) = 53. Recalibrate
+# here, not in the algorithm. See docs/specs/investigation-cost-guardrails.md.
+MAX_HYPOTHESES_PER_GENERATE = 8
+MAX_CHILDREN_PER_DEEPEN = 3
+MAX_DEEPEN_PER_LEVEL = 5
 
 
 class Coordinator:
@@ -176,6 +189,7 @@ class Coordinator:
         system_prompt, user_prompt = prompts.generate_hypotheses_prompt(
             alert_labels=self._alert_labels(incident),
             exploratory_evidence=exploratory,
+            max_count=MAX_HYPOTHESES_PER_GENERATE,
         )
         output = await self.llm.generate_structured(
             prompt=user_prompt,
@@ -184,7 +198,11 @@ class Coordinator:
         )
         assert isinstance(output, GenerateHypothesesOutput)
 
-        for proposal in output.hypotheses:
+        proposals = self._truncate_proposals(
+            output.hypotheses, MAX_HYPOTHESES_PER_GENERATE, f"hypothesis generation for {incident.id}",
+        )
+
+        for proposal in proposals:
             incident.add_hypothesis(
                 statement=proposal.statement,
                 parent_id=proposal.parent_id,
@@ -217,6 +235,17 @@ class Coordinator:
                     if incident.hypotheses.index(root) < incident.hypotheses.index(h):
                         h.parent_id = root.id
                         break
+
+    @staticmethod
+    def _truncate_proposals(
+        proposals: list[HypothesisProposal], cap: int, what: str
+    ) -> list[HypothesisProposal]:
+        """Slice a generate/deepen call's output to the cap, keeping the
+        model's own first N — logging only when it actually truncates
+        something, so the cap engaging is visible without being noisy."""
+        if len(proposals) > cap:
+            logger.info("Truncated %s: %d proposed, kept first %d", what, len(proposals), cap)
+        return proposals[:cap]
 
     # ------------------------------------------------------------------
     # Phase: Investigate Hypotheses (loop)
@@ -252,7 +281,21 @@ class Coordinator:
                 logger.info("No deepenable leaves at depth %d — converged", depth)
                 break
 
-            new_children = await self._deepen(incident, leaves)
+            # Deepen only the most-confident leaves. This is the more
+            # consequential of the two breadth caps: it bounds the number of
+            # deepen *calls* (one per leaf, not batched), not just the size of
+            # one call's output. Prioritizing by confidence also means the
+            # branches given the remaining budget are the ones most likely
+            # to be true, not just the ones the model happened to list first.
+            to_deepen = sorted(leaves, key=lambda h: h.confidence, reverse=True)
+            to_deepen = to_deepen[:MAX_DEEPEN_PER_LEVEL]
+            if len(leaves) > MAX_DEEPEN_PER_LEVEL:
+                logger.info(
+                    "Depth %d for %s: %d confirmed leaves, deepening the %d most confident",
+                    depth, incident.id, len(leaves), MAX_DEEPEN_PER_LEVEL,
+                )
+
+            new_children = await self._deepen(incident, to_deepen)
             if not new_children:
                 logger.info("No new child hypotheses at depth %d — converged", depth)
                 break
@@ -355,15 +398,17 @@ class Coordinator:
         return None
 
     async def _deepen(
-        self, incident: Incident, confirmed: list[Hypothesis]
+        self, incident: Incident, to_deepen: list[Hypothesis]
     ) -> list[Hypothesis]:
-        """Generate child hypotheses for confirmed parents."""
+        """Generate child hypotheses for the given (already breadth-capped) parents."""
         new_children: list[Hypothesis] = []
 
-        for hyp in confirmed:
+        for hyp in to_deepen:
             chain = hyp.ancestor_chain(incident.hypotheses)
             summaries = [prompts.format_evidence(e) for e in hyp.evidence]
-            system_prompt, user_prompt = prompts.deepen_hypotheses_prompt(hyp, chain, summaries)
+            system_prompt, user_prompt = prompts.deepen_hypotheses_prompt(
+                hyp, chain, summaries, max_count=MAX_CHILDREN_PER_DEEPEN,
+            )
             output = await self.llm.generate_structured(
                 prompt=user_prompt,
                 output_schema=DeepenHypothesesOutput,
@@ -371,7 +416,11 @@ class Coordinator:
             )
             assert isinstance(output, DeepenHypothesesOutput)
 
-            for proposal in output.child_hypotheses:
+            children = self._truncate_proposals(
+                output.child_hypotheses, MAX_CHILDREN_PER_DEEPEN, f"deepen for hypothesis {hyp.id}",
+            )
+
+            for proposal in children:
                 child = incident.add_hypothesis(
                     statement=proposal.statement,
                     parent_id=hyp.id,

@@ -264,6 +264,8 @@ Copy [`.env.example`](.env.example) to `.env` and edit it. Every `task` target l
 | `TEMPO_URL` | `http://localhost:3200` | Tempo query API |
 | `MAX_CONCURRENT_INVESTIGATIONS` | `3` | Max concurrent Coordinator runs |
 | `STALE_THRESHOLD_HOURS` | `24` | Hours before an investigation is flagged stale |
+| `LLM_TOKEN_BUDGET_DAILY` | unset (no ceiling) | Cumulative input+output tokens allowed per UTC day. In-memory, resets on restart — see [spec](docs/specs/investigation-cost-guardrails.md) |
+| `LLM_TOKEN_BUDGET_WEEKLY` | unset (no ceiling) | Same, per UTC week (Monday–Monday) |
 
 ## Testing
 

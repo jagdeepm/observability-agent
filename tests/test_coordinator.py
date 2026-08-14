@@ -13,7 +13,12 @@ import time
 import pytest
 
 from observability_agent.agents.protocols import MockAgent
-from observability_agent.coordinator.engine import Coordinator
+from observability_agent.coordinator.engine import (
+    MAX_CHILDREN_PER_DEEPEN,
+    MAX_DEEPEN_PER_LEVEL,
+    MAX_HYPOTHESES_PER_GENERATE,
+    Coordinator,
+)
 from observability_agent.coordinator.outputs import (
     DeepenHypothesesOutput,
     EvaluateHypothesesOutput,
@@ -61,6 +66,7 @@ def make_incident() -> Incident:
 def make_coordinator(
     llm: MockLLMProvider | None = None,
     repo: InMemoryIncidentRepository | None = None,
+    max_depth: int = 2,
     **agent_overrides,
 ) -> tuple[Coordinator, MockLLMProvider, InMemoryIncidentRepository, dict]:
     """Create a Coordinator with all mock dependencies."""
@@ -80,13 +86,13 @@ def make_coordinator(
     coord = Coordinator(
         llm=mock_llm,
         repo=mock_repo,
+        max_depth=max_depth,
         metrics_agent=agents["metrics"],
         logs_agent=agents["logs"],
         trace_agent=agents["traces"],
         kubernetes_agent=agents["kubernetes"],
         deployment_agent=agents["deployment"],
         knowledge_agent=agents["knowledge"],
-        max_depth=2,
     )
     return coord, mock_llm, mock_repo, agents
 
@@ -387,6 +393,166 @@ async def test_hypothesis_generation():
     assert root.is_root
     assert not child.is_root
     assert child.parent_id == root.id
+
+
+# ---------------------------------------------------------------------------
+# Hypothesis breadth cap — spec: docs/specs/investigation-cost-guardrails.md
+#
+# A real LLM does not share a mock's restraint. These deliberately register
+# more than the cap allows, which the existing suite never had reason to do.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_generation_is_truncated_to_the_cap():
+    """More hypotheses than the cap allows are proposed; only the cap survives."""
+    inc = make_incident()
+    coord, mock_llm, repo, agents = make_coordinator()
+    await repo.save(inc)
+    register_exploratory(agents)
+
+    proposed = MAX_HYPOTHESES_PER_GENERATE + 5
+    mock_llm.register(GenerateHypothesesOutput, GenerateHypothesesOutput(
+        hypotheses=[HypothesisProposal(statement=f"hyp {i}") for i in range(proposed)]
+    ))
+    for _ in range(MAX_HYPOTHESES_PER_GENERATE):
+        agents["metrics"].register(Evidence(
+            source=EvidenceSource.PROMETHEUS, query="q", summary="ok", collected_by="metrics",
+        ))
+    mock_llm.register(EvaluateHypothesesOutput, EvaluateHypothesesOutput(
+        evaluations=[
+            HypothesisEvaluation(hypothesis_id="will-be-set", status="refuted", confidence=0.0, reasoning="no")
+            for _ in range(MAX_HYPOTHESES_PER_GENERATE)
+        ]
+    ))
+    mock_llm.register(RCAOutput, RCAOutput(
+        root_cause_summary="none confirmed", confidence=0.0, remediation_action="none",
+    ))
+
+    result = await coord.run(inc.id)
+
+    assert len(result.hypotheses) == MAX_HYPOTHESES_PER_GENERATE
+
+
+@pytest.mark.asyncio
+async def test_generation_at_exactly_the_cap_is_not_truncated():
+    """The boundary is inclusive — exactly the cap keeps every proposal."""
+    inc = make_incident()
+    coord, mock_llm, repo, agents = make_coordinator()
+    await repo.save(inc)
+    register_exploratory(agents)
+
+    mock_llm.register(GenerateHypothesesOutput, GenerateHypothesesOutput(
+        hypotheses=[HypothesisProposal(statement=f"hyp {i}") for i in range(MAX_HYPOTHESES_PER_GENERATE)]
+    ))
+    for _ in range(MAX_HYPOTHESES_PER_GENERATE):
+        agents["metrics"].register(Evidence(
+            source=EvidenceSource.PROMETHEUS, query="q", summary="ok", collected_by="metrics",
+        ))
+    mock_llm.register(EvaluateHypothesesOutput, EvaluateHypothesesOutput(
+        evaluations=[
+            HypothesisEvaluation(hypothesis_id="will-be-set", status="refuted", confidence=0.0, reasoning="no")
+            for _ in range(MAX_HYPOTHESES_PER_GENERATE)
+        ]
+    ))
+    mock_llm.register(RCAOutput, RCAOutput(
+        root_cause_summary="none confirmed", confidence=0.0, remediation_action="none",
+    ))
+
+    result = await coord.run(inc.id)
+
+    assert len(result.hypotheses) == MAX_HYPOTHESES_PER_GENERATE
+
+
+@pytest.mark.asyncio
+async def test_deepen_call_output_is_truncated_to_the_cap():
+    """One confirmed hypothesis proposes more children than the cap allows."""
+    inc = make_incident()
+    coord, mock_llm, repo, agents = make_coordinator(max_depth=1)
+    await repo.save(inc)
+    register_exploratory(agents)
+
+    mock_llm.register(GenerateHypothesesOutput, GenerateHypothesesOutput(
+        hypotheses=[HypothesisProposal(statement="root cause candidate")]
+    ))
+    agents["metrics"].register(Evidence(
+        source=EvidenceSource.PROMETHEUS, query="q", summary="ok", collected_by="metrics",
+    ))
+    mock_llm.register(EvaluateHypothesesOutput, EvaluateHypothesesOutput(
+        evaluations=[
+            HypothesisEvaluation(hypothesis_id="will-be-set", status="confirmed", confidence=0.9, reasoning="ok"),
+        ]
+    ))
+    proposed_children = MAX_CHILDREN_PER_DEEPEN + 5
+    mock_llm.register(DeepenHypothesesOutput, DeepenHypothesesOutput(
+        child_hypotheses=[HypothesisProposal(statement=f"child {i}") for i in range(proposed_children)]
+    ))
+    mock_llm.register(RCAOutput, RCAOutput(
+        root_cause_summary="root cause candidate", confidence=0.9, remediation_action="restart deployment x",
+    ))
+
+    result = await coord.run(inc.id)
+
+    assert len(result.hypotheses) == 1 + MAX_CHILDREN_PER_DEEPEN
+
+
+@pytest.mark.asyncio
+async def test_only_the_most_confident_leaves_are_deepened():
+    """More confirmed leaves than MAX_DEEPEN_PER_LEVEL — only the top-K by
+    confidence get a deepen call. The rest stay confirmed, not dropped.
+
+    Confidence is deliberately not correlated with list position (index 7 is
+    selected, indices 1/3/5 in the middle are not), so this fails if deepening
+    picks by list order rather than by confidence.
+    """
+    assert MAX_HYPOTHESES_PER_GENERATE > MAX_DEEPEN_PER_LEVEL, (
+        "test assumes the generation cap exceeds the deepen-per-level cap; "
+        "adjust this test if that relationship changes"
+    )
+    inc = make_incident()
+    coord, mock_llm, repo, agents = make_coordinator(max_depth=1)
+    await repo.save(inc)
+    register_exploratory(agents)
+
+    n = MAX_DEEPEN_PER_LEVEL + 3
+    confidences = [0.9, 0.1, 0.8, 0.1, 0.7, 0.1, 0.6, 0.5][:n]
+    expected_deepened = {i for i, c in enumerate(confidences) if c >= 0.5}
+    assert len(expected_deepened) == MAX_DEEPEN_PER_LEVEL
+
+    mock_llm.register(GenerateHypothesesOutput, GenerateHypothesesOutput(
+        hypotheses=[HypothesisProposal(statement=f"hyp {i}") for i in range(n)]
+    ))
+    for _ in range(n):
+        agents["metrics"].register(Evidence(
+            source=EvidenceSource.PROMETHEUS, query="q", summary="ok", collected_by="metrics",
+        ))
+    mock_llm.register(EvaluateHypothesesOutput, EvaluateHypothesesOutput(
+        evaluations=[
+            HypothesisEvaluation(hypothesis_id="will-be-set", status="confirmed", confidence=c, reasoning="ok")
+            for c in confidences
+        ]
+    ))
+    for _ in range(MAX_DEEPEN_PER_LEVEL):
+        mock_llm.register(DeepenHypothesesOutput, DeepenHypothesesOutput(child_hypotheses=[]))
+    mock_llm.register(RCAOutput, RCAOutput(
+        root_cause_summary="hyp 0", confidence=0.9, remediation_action="restart deployment x",
+    ))
+
+    result = await coord.run(inc.id)
+
+    deepen_prompts = [c["prompt"] for c in mock_llm.calls if c["output_schema"] == "DeepenHypothesesOutput"]
+    assert len(deepen_prompts) == MAX_DEEPEN_PER_LEVEL
+    for i in range(n):
+        stmt = f"hyp {i}"
+        was_deepened = any(stmt in p for p in deepen_prompts)
+        assert was_deepened == (i in expected_deepened), (
+            f"{stmt} (confidence {confidences[i]}): expected deepened={i in expected_deepened}"
+        )
+
+    # Nothing dropped — every hypothesis is still present and confirmed,
+    # whether or not it was one of the ones deepened.
+    assert len(result.hypotheses) == n
+    assert all(h.status == HypothesisStatus.CONFIRMED for h in result.hypotheses)
 
 
 # ---------------------------------------------------------------------------

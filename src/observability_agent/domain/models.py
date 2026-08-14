@@ -305,6 +305,8 @@ class Incident(BaseModel):
     updated_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
     is_stale: bool = False
     stale_flagged_at: datetime | None = None
+    llm_budget_exceeded: bool = False
+    budget_exceeded_flagged_at: datetime | None = None
 
     # ---- State transitions ----
 
@@ -399,6 +401,20 @@ class Incident(BaseModel):
         self.is_stale = True
         self.stale_flagged_at = datetime.now(timezone.utc)
         self._log("system", "flagged_stale", "Incident has exceeded investigation time threshold")
+
+    def flag_budget_exceeded(self) -> None:
+        """Mark the investigation halted by a configured LLM token ceiling.
+
+        Deliberately distinct from flag_stale — "ran out of budget" and "took
+        too long" are different causes, and a human reading this later should
+        not have to guess which one happened from an is_stale bool alone.
+        """
+        self.llm_budget_exceeded = True
+        self.budget_exceeded_flagged_at = datetime.now(timezone.utc)
+        self._log(
+            "system", "flagged_budget_exceeded",
+            "Investigation halted — LLM token budget exceeded, human review needed",
+        )
 
     # ---- Hypothesis management ----
 
