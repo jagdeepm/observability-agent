@@ -7,6 +7,9 @@ correctly to the Incident, and handle the full lifecycle?
 
 from __future__ import annotations
 
+import asyncio
+import time
+
 import pytest
 
 from observability_agent.agents.protocols import MockAgent
@@ -155,6 +158,88 @@ async def test_full_happy_path():
     assert result.remediation.action == "scale checkout deployment to 5 replicas"
     assert len(result.hypotheses) == 2
     assert repo.save_count > 0
+
+
+class SlowMockAgent(MockAgent):
+    """A MockAgent whose call genuinely yields control, via a real sleep.
+
+    A mock that returns instantly can't distinguish concurrent scheduling from
+    sequential — both finish in the same (near-zero) wall time. This one only
+    proves the point if the delay is real.
+    """
+
+    def __init__(self, responses: list[Evidence], delay: float) -> None:
+        super().__init__(responses)
+        self.delay = delay
+
+    async def __call__(self, *args, **kwargs) -> Evidence:
+        await asyncio.sleep(self.delay)
+        return await super().__call__(*args, **kwargs)
+
+
+@pytest.mark.asyncio
+async def test_targeted_evidence_gathered_concurrently():
+    """Evidence for independent hypotheses is gathered in parallel, not one at a
+    time — mirroring the exploratory-evidence phase, which already does this.
+
+    Three hypotheses route to three different agents (via _pick_source keywords),
+    each taking a real 0.15s. The same three agents also answer the exploratory
+    phase, which is already concurrent — so the honest floor is two concurrent
+    waves (~0.30s), not one. If targeted gathering regressed to sequential, the
+    total would be exploratory (0.15s) + 3×0.15s sequential = 0.60s. The
+    assertion sits between those two, well clear of either.
+    """
+    inc = make_incident()
+    delay = 0.15
+    agents = {
+        "metrics": MockAgent(),
+        "logs": SlowMockAgent(
+            [Evidence(source=EvidenceSource.LOKI, query="q", summary="log ev", collected_by="logs_agent")],
+            delay=delay,
+        ),
+        "traces": SlowMockAgent(
+            [Evidence(source=EvidenceSource.TEMPO, query="q", summary="trace ev", collected_by="trace_agent")],
+            delay=delay,
+        ),
+        "kubernetes": MockAgent(),
+        "deployment": SlowMockAgent(
+            [Evidence(source=EvidenceSource.DEPLOYMENT, query="q", summary="deploy ev", collected_by="deployment_agent")],
+            delay=delay,
+        ),
+        "knowledge": MockAgent(),
+    }
+    coord, mock_llm, repo, agents = make_coordinator(**agents)
+    await repo.save(inc)
+    register_exploratory(agents)
+
+    # Keywords route to logs, traces, and deployment respectively (see _pick_source).
+    mock_llm.register(GenerateHypothesesOutput, GenerateHypothesesOutput(
+        hypotheses=[
+            HypothesisProposal(statement="an exception is logged during checkout"),
+            HypothesisProposal(statement="a slow trace span points at the database"),
+            HypothesisProposal(statement="a recent deploy changed the config"),
+        ]
+    ))
+    mock_llm.register(EvaluateHypothesesOutput, EvaluateHypothesesOutput(
+        evaluations=[
+            HypothesisEvaluation(hypothesis_id="will-be-set", status="refuted", confidence=0.0, reasoning="a"),
+            HypothesisEvaluation(hypothesis_id="will-be-set", status="refuted", confidence=0.0, reasoning="b"),
+            HypothesisEvaluation(hypothesis_id="will-be-set", status="refuted", confidence=0.0, reasoning="c"),
+        ]
+    ))
+    mock_llm.register(RCAOutput, RCAOutput(
+        root_cause_summary="no confirmed hypothesis", confidence=0.0, remediation_action="none",
+    ))
+
+    started = time.monotonic()
+    result = await coord.run(inc.id)
+    elapsed = time.monotonic() - started
+
+    assert elapsed < delay * 3, (
+        f"took {elapsed:.3f}s — evidence gathering does not look concurrent "
+        f"(sequential total would be ~{delay * 4:.3f}s; concurrent is ~{delay * 2:.3f}s)"
+    )
+    assert result.status in (IncidentStatus.RCA_PRODUCED, IncidentStatus.PENDING_APPROVAL, IncidentStatus.OPEN)
 
 
 @pytest.mark.asyncio

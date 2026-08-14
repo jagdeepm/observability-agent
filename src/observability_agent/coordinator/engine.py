@@ -265,20 +265,34 @@ class Coordinator:
     async def _gather_targeted_evidence(
         self, incident: Incident, hypotheses: list[Hypothesis]
     ) -> None:
-        """For each hypothesis, ask the most relevant agent to gather evidence."""
+        """Ask the most relevant agent to investigate each hypothesis, concurrently.
+
+        One hypothesis's evidence gathering does not depend on another's, so this
+        mirrors the exploratory-evidence phase (six agents in parallel) rather than
+        awaiting them one at a time. A wide hypothesis set previously meant a wide
+        multiple of sequential network+LLM round trips — live-observed reaching
+        100+ hypotheses and tens of minutes of wall clock. `_safe_call` never
+        raises, so `asyncio.gather` here can't be short-circuited by one agent's
+        failure, exactly as exploratory evidence already relies on.
+        """
+        tasks = []
         for hyp in hypotheses:
             source = self._pick_source(hyp.statement)
             agent = self._agent_for_source(source)
             if agent is None:
                 continue
-
-            evidence = await self._safe_call(
+            tasks.append(self._safe_call(
                 agent,
                 query=f"investigate: {hyp.statement}",
                 source=source,
                 hypothesis_id=hyp.id,
                 extra_context={"incident_title": incident.title},
-            )
+            ))
+
+        if not tasks:
+            return
+
+        for evidence in await asyncio.gather(*tasks):
             incident.add_evidence(evidence)
 
     async def _evaluate_all(
