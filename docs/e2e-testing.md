@@ -60,6 +60,7 @@ pip install -e ".[dev]"
 # Configure the LLM
 task env-init          # creates .env from .env.example
 $EDITOR .env           # fill in LLM_BASE_URL, LLM_API_KEY, LLM_MODEL
+task llm-check         # confirm it works before building a cluster
 
 # Run everything (cluster → monitoring → loki → tempo → demo → agent → tests)
 task all
@@ -108,6 +109,19 @@ LLM_API_KEY=not-needed
 LLM_BASE_URL=http://localhost:11434/v1
 LLM_MODEL=openai:llama3
 ```
+
+### Verifying the endpoint
+
+Run this before `task all` — it takes seconds and catches the mistakes that otherwise surface twenty minutes into a cluster build:
+
+```bash
+task llm-check     # endpoint reachable, model name valid, structured output works
+task llm-models    # list the model names the endpoint offers
+```
+
+The third check is the one that matters. The agent never asks for free text — every call goes through `generate_structured` with a Pydantic schema, which needs tool calling or JSON-schema support all the way through the proxy to the model. An endpoint can answer `/v1/models` happily and still be unusable here.
+
+It also flags a slow endpoint: an investigation makes roughly ten calls, so anything over ~20s per call needs a raised `E2E_TIMEOUT`.
 
 ### Switching modes on a running cluster
 
@@ -186,6 +200,8 @@ Faults come from the demo's own flagd feature flags, so the failures are real: t
 |---|---|
 | `task agent-logs` | Stream agent pod logs |
 | `task agent-restart` | Restart the agent deployment |
+| `task llm-check` | Verify the endpoint, model name, and structured output |
+| `task llm-models` | List the models the endpoint offers |
 | `task agent-configure-llm` | Re-read `.env`, patch secret + configmap, restart the pod |
 | `task agent-use-mock` | Switch back to mock mode |
 | `task run-local` | Run the agent on your machine against the port-forwards |

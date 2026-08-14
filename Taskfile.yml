@@ -317,6 +317,16 @@ tasks:
         echo "Agent pods:"
         kubectl get pods -n {{.AGENT_NS}}
 
+  llm-check:
+    desc: Verify the .env LLM endpoint, model name, and structured output
+    cmds:
+      - python3 deploy/scripts/llm-check.py
+
+  llm-models:
+    desc: List the model names the configured LLM endpoint offers
+    cmds:
+      - python3 deploy/scripts/llm-check.py --list
+
   llm-config:
     desc: Push LLM_MODEL / LLM_MOCK from the environment (.env) into the agent ConfigMap
     cmds:
