@@ -31,6 +31,16 @@ vars:
   AGENT_NS: observability-agent
   DEMO_NS: otel-demo
   AGENT_IMAGE: observability-agent:local
+  # Every task that imports project code (pytest, httpx, observability_agent
+  # itself) goes through this, not a bare `python`/`python3` — Task runs each
+  # command in its own subprocess, which does not inherit an activated venv
+  # from the shell that ran `task`. Relying on ambient PATH meant `task all`
+  # failed with "python: executable file not found" for anyone whose system
+  # has no bare `python`, and would have failed one step later with
+  # ModuleNotFoundError even with `python3`, since the system interpreter has
+  # none of this project's dependencies installed. `task env-init`'s and
+  # CONTRIBUTING.md's own quick start both require .venv to exist first.
+  PYTHON: '{{.PYTHON | default ".venv/bin/python"}}'
   # Pinned — the demo renames services and feature flags between majors, and the
   # e2e tests and alert rules are written against this version (app 3.0.0).
   DEMO_CHART_VERSION: '{{.DEMO_CHART_VERSION | default "0.41.0"}}'
@@ -327,12 +337,14 @@ tasks:
   llm-check:
     desc: Verify the .env LLM endpoint, model name, and structured output
     cmds:
-      - python3 deploy/scripts/llm-check.py
+      - |
+        {{.PYTHON}} deploy/scripts/llm-check.py
 
   llm-models:
     desc: List the model names the configured LLM endpoint offers
     cmds:
-      - python3 deploy/scripts/llm-check.py --list
+      - |
+        {{.PYTHON}} deploy/scripts/llm-check.py --list
 
   llm-config:
     desc: Push LLM_MODEL / LLM_MOCK from the environment (.env) into the agent ConfigMap
@@ -507,18 +519,20 @@ tasks:
     cmds:
       - |
         # Same code path the e2e tests use, so a flag rename breaks both at once.
-        python3 -c 'import sys; from tests.e2e.helpers import set_flag; set_flag(*sys.argv[1:])' {{.CLI_ARGS}}
+        {{.PYTHON}} -c 'import sys; from tests.e2e.helpers import set_flag; set_flag(*sys.argv[1:])' {{.CLI_ARGS}}
         echo "Check alerts: http://localhost:9091/api/v1/alerts"
 
   list-faults:
     desc: List the flagd feature flags available in the deployed demo
     cmds:
-      - python3 -c 'from tests.e2e.helpers import list_flags; [print(f"{k:28} {v}") for k, v in list_flags().items()]'
+      - |
+        {{.PYTHON}} -c 'from tests.e2e.helpers import list_flags; [print(f"{k:28} {v}") for k, v in list_flags().items()]'
 
   reset-faults:
     desc: Return every flagd flag to its shipped default
     cmds:
-      - python3 -c 'from tests.e2e.helpers import reset_flags; reset_flags()'
+      - |
+        {{.PYTHON}} -c 'from tests.e2e.helpers import reset_flags; reset_flags()'
       - echo "All flags reset"
 
   inject-crash:
@@ -541,7 +555,7 @@ tasks:
         echo "Running e2e tests..."
         AGENT_URL=http://localhost:8080 \
         PROMETHEUS_URL=http://localhost:9091 \
-        python -m pytest tests/e2e/ -v -m e2e --tb=long --timeout={{.E2E_TIMEOUT | default 1800}}
+        {{.PYTHON}} -m pytest tests/e2e/ -v -m e2e --tb=long --timeout={{.E2E_TIMEOUT | default 1800}}
 
   e2e-test-one:
     desc: 'Run a subset of the e2e tests. Usage: task e2e-test-one -- tests/e2e/test_error_faults.py'
@@ -549,7 +563,7 @@ tasks:
       - |
         AGENT_URL=http://localhost:8080 \
         PROMETHEUS_URL=http://localhost:9091 \
-        python -m pytest {{.CLI_ARGS}} -v -m e2e --tb=long --timeout={{.E2E_TIMEOUT | default 1800}}
+        {{.PYTHON}} -m pytest {{.CLI_ARGS}} -v -m e2e --tb=long --timeout={{.E2E_TIMEOUT | default 1800}}
 
   # -------------------------------------------------------------------------
   # Smoke test
