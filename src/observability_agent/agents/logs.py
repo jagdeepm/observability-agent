@@ -84,7 +84,9 @@ class LogsAgent:
         return (
             "You are a Loki/LogQL expert. Translate natural language queries into "
             f"valid LogQL. {available} "
-            "Use |= for substring search and |~ for regex. Keep the pipeline simple: "
+            "Use |= for substring search and |~ for regex. Log levels are written in "
+            "any case (\"Error\", \"ERROR\", \"error\"), so make regex filters "
+            "case-insensitive: |~ \"(?i)error|fail|exception\". Keep the pipeline simple: "
             "a label selector plus at most one line filter. Do not use json, pattern, "
             "unwrap or label_format. Do not put a time range in the query itself."
         )

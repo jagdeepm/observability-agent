@@ -489,7 +489,11 @@ class Incident(BaseModel):
         path = best_leaf.confirmed_path(self.hypotheses)
         causal_chain = [h.statement for h in (path or [best_leaf])]
 
-        all_evidence = []
+        # Exploratory evidence (all six sources, gathered before any hypothesis
+        # existed) belongs in the report too. Only hypothesis-attached evidence
+        # used to be listed, and _pick_source routes most hypotheses to Prometheus,
+        # so the computed log signals (error_count) never reached the RCA.
+        all_evidence = list(self.exploratory_evidence)
         for h in path or [best_leaf]:
             all_evidence.extend(h.evidence)
 

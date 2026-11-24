@@ -288,10 +288,16 @@ def assert_rca(
         for item in evidence:
             seen.update(item.get("signals") or {})
         missing = expect_signals - seen
+        dump = "\n".join(
+            f"  - {e.get('source')} | {str(e.get('query'))[:100]} | "
+            f"{str(e.get('summary'))[:160]} | {e.get('signals')}"
+            for e in evidence
+        )
         assert not missing, (
-            f"Expected computed signals {sorted(missing)} on the RCA evidence, "
-            f"got {sorted(seen) or 'none'}. Sources: "
-            f"{sorted({e.get('source') for e in evidence})}"
+            f"Incident {incident.get('id')} {incident.get('title')!r} "
+            f"(hypotheses={incident.get('hypothesis_count')}): expected computed "
+            f"signals {sorted(missing)} on the RCA evidence, got "
+            f"{sorted(seen) or 'none'}. Evidence:\n{dump}"
         )
 
 
