@@ -15,6 +15,7 @@ Each entry is one concrete, evidenced incident — what happened, why, what fixe
 | [003](003-llm-calls-need-the-same-reliability-discipline-as-any-network-call.md) | LLM calls need the same reliability discipline as any other network call | Reliability engineering for agents |
 | [004](004-real-llm-cost-is-a-design-surface-not-an-afterthought.md) | Real LLM cost is a design surface, not an afterthought | Cost as a reliability concern |
 | [005](005-live-infrastructure-has-truths-no-code-review-finds.md) | Live infrastructure has truths no code review finds | Verification — running the real thing |
+| [006](006-an-end-to-end-failure-does-not-say-which-layer-failed.md) | An end-to-end failure doesn't say which layer failed, so prove the harness before debugging the agent | Testing agentic systems |
 
 ## For the presentation
 
