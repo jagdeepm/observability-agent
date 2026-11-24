@@ -7,6 +7,7 @@ from typing import Any
 
 from pydantic import BaseModel, Field
 
+from observability_agent.analysis import analyze_metrics
 from observability_agent.domain.models import Evidence, EvidenceSource
 from observability_agent.infrastructure.llm_provider import LLMProvider
 from observability_agent.mcp.prometheus import PrometheusClient
@@ -22,13 +23,12 @@ class PromQLOutput(BaseModel):
 
 
 class MetricsSummaryOutput(BaseModel):
-    """LLM summarizes Prometheus query results."""
+    """LLM summarizes Prometheus query results.
+
+    Anomaly detection is not asked of the LLM — it is computed in analysis.py.
+    """
 
     summary: str = Field(description="Natural language summary of the results")
-    anomaly_detected: bool = Field(
-        default=False,
-        description="Whether the results indicate an anomaly from baseline",
-    )
 
 
 class MetricsAgent:
@@ -97,14 +97,16 @@ class MetricsAgent:
                 collected_by="metrics_agent",
             )
 
-        # Step 3: Summarize results
+        # Step 3: Compute the facts, then have the LLM put them into words
+        analysis = analyze_metrics(raw)
+
         summary_output = await self.llm.generate_structured(
-            prompt=self._build_summary_prompt(natural_language, raw),
+            prompt=self._build_summary_prompt(natural_language, analysis.text),
             output_schema=MetricsSummaryOutput,
             system_prompt=(
-                "You are an SRE analyzing Prometheus metrics. Summarize the query "
-                "results in 1-3 sentences. Note any anomalies, spikes, or deviations "
-                "from expected baselines. Be specific about values and time ranges."
+                "You are an SRE analyzing Prometheus metrics. Summarize the computed "
+                "statistics in 1-3 sentences. The numbers are already calculated — cite "
+                "them, do not recompute or estimate them. Be specific about values."
             ),
         )
         assert isinstance(summary_output, MetricsSummaryOutput)
@@ -117,8 +119,8 @@ class MetricsAgent:
                 "promql": promql_output.promql,
                 "explanation": promql_output.explanation,
                 "result": raw,
-                "anomaly_detected": summary_output.anomaly_detected,
             },
+            signals=analysis.signals,
             hypothesis_id=hypothesis_id,
             collected_by="metrics_agent",
         )
@@ -138,15 +140,9 @@ class MetricsAgent:
             parts.append(f"Incident: {ctx['incident_title']}")
         return "\n".join(parts)
 
-    def _build_summary_prompt(
-        self, nl: str, raw: dict[str, Any]
-    ) -> str:
-        # ponytail: truncate large results to keep prompt size reasonable
-        result_str = str(raw)
-        if len(result_str) > 4000:
-            result_str = result_str[:4000] + "...(truncated)"
+    def _build_summary_prompt(self, nl: str, analysis_text: str) -> str:
         return (
             f"Original query: {nl}\n\n"
-            f"Prometheus API response:\n{result_str}\n\n"
+            f"{analysis_text}\n\n"
             f"Summarize these results in 1-3 sentences."
         )

@@ -7,6 +7,7 @@ from typing import Any
 
 from pydantic import BaseModel, Field
 
+from observability_agent.analysis import analyze_logs
 from observability_agent.domain.models import Evidence, EvidenceSource
 from observability_agent.infrastructure.llm_provider import LLMProvider
 from observability_agent.mcp.loki import LokiClient
@@ -20,8 +21,9 @@ class LogQLOutput(BaseModel):
 
 
 class LogsSummaryOutput(BaseModel):
+    """Error counting is not asked of the LLM — it is computed in analysis.py."""
+
     summary: str = Field(description="Natural language summary of the log results")
-    error_count: int = Field(default=0, description="Number of error-level log lines found")
 
 
 class LogsAgent:
@@ -80,10 +82,15 @@ class LogsAgent:
                 collected_by="logs_agent",
             )
 
+        analysis = analyze_logs(raw)
+
         summary_output = await self.llm.generate_structured(
-            prompt=f"Original query: {nl}\nLoki results:\n{str(raw)[:4000]}",
+            prompt=f"Original query: {nl}\n{analysis.text}",
             output_schema=LogsSummaryOutput,
-            system_prompt="Summarize log query results in 1-3 sentences. Count error-level lines.",
+            system_prompt=(
+                "Summarize these log results in 1-3 sentences. Counts are already "
+                "computed — cite them, do not recount."
+            ),
         )
         assert isinstance(summary_output, LogsSummaryOutput)
 
@@ -95,8 +102,8 @@ class LogsAgent:
                 "logql": logql_output.logql,
                 "explanation": logql_output.explanation,
                 "result": raw,
-                "error_count": summary_output.error_count,
             },
+            signals=analysis.signals,
             hypothesis_id=hypothesis_id,
             collected_by="logs_agent",
         )

@@ -90,6 +90,8 @@ class KubernetesAgent:
                 collected_by="kubernetes_agent",
             )
 
+        # ponytail: no deterministic analysis here — kubernetes payloads are short
+        # and semi-structured, so truncation loses nothing worth computing.
         summary_output = await self.llm.generate_structured(
             prompt=f"Original query: {nl}\nK8s results:\n{str(raw)[:4000]}",
             output_schema=K8sSummaryOutput,

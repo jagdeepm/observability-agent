@@ -83,6 +83,8 @@ class DeploymentAgent:
                 collected_by="deployment_agent",
             )
 
+        # ponytail: no deterministic analysis here — deployment payloads are short
+        # and semi-structured, so truncation loses nothing worth computing.
         summary_output = await self.llm.generate_structured(
             prompt=f"Original query: {nl}\nDeployment data:\n{str(raw)[:4000]}",
             output_schema=DeploymentSummaryOutput,

@@ -67,6 +67,10 @@ class RemediationStatus(str, Enum):
     FAILED = "failed"
 
 
+# A scalar fact computed from a telemetry payload rather than inferred by the LLM.
+Signal = str | int | float | bool
+
+
 class EvidenceSource(str, Enum):
     PROMETHEUS = "prometheus"
     LOKI = "loki"
@@ -172,6 +176,10 @@ class Evidence(BaseModel):
     summary: str = ""
     raw_payload: dict[str, Any] = Field(default_factory=dict)
     collected_by: str = ""  # agent type that collected this
+    # Facts computed in code rather than inferred by the LLM (see analysis.py).
+    # Rendered into Coordinator prompts alongside summary; empty for sources
+    # whose payloads carry nothing worth computing.
+    signals: dict[str, Signal] = Field(default_factory=dict)
 
 
 class Hypothesis(BaseModel):

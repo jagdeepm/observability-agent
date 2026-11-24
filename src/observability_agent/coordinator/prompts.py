@@ -14,17 +14,28 @@ Be precise, evidence-driven, and cite specific data points in your reasoning.
 Always prefer the most specific root cause over vague generalizations."""
 
 
+def format_evidence(evidence: Evidence) -> str:
+    """Render one Evidence for a prompt: summary, plus computed facts when present.
+
+    The single formatting point for Evidence across all prompts — the Coordinator
+    passes pre-formatted strings to the builders that take summaries.
+    """
+    line = f"- [{evidence.source.value}] {evidence.summary}"
+    if evidence.signals:
+        facts = " ".join(f"{k}={v}" for k, v in evidence.signals.items())
+        line += f"\n  facts: {facts}"
+    return line
+
+
 def generate_hypotheses_prompt(
     alert_labels: dict[str, str],
     exploratory_evidence: list[Evidence],
 ) -> tuple[str, str]:
     """Build prompt for the hypothesis generation step.
 
-    Context: alert labels + exploratory evidence summaries.
+    Context: alert labels + exploratory evidence summaries and computed signals.
     """
-    evidence_text = "\n".join(
-        f"- [{e.source.value}] {e.summary}" for e in exploratory_evidence
-    )
+    evidence_text = "\n".join(format_evidence(e) for e in exploratory_evidence)
     if not evidence_text:
         evidence_text = "(no exploratory evidence gathered yet)"
 
@@ -107,7 +118,7 @@ def produce_rca_prompt(
     """
     chain_text = " → ".join(h.statement for h in confirmed_path)
     evidence_text = "\n".join(
-        f"- [{e.source.value}] {e.summary} (confidence: {h.confidence if (h := _find_parent(e, confirmed_path)) else 'N/A'})"
+        f"{format_evidence(e)} (confidence: {h.confidence if (h := _find_parent(e, confirmed_path)) else 'N/A'})"
         for e in all_evidence
     )
 
