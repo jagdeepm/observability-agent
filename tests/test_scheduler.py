@@ -11,9 +11,14 @@ from observability_agent.infrastructure.scheduler import Scheduler
 
 
 class MockCoordinator:
-    """Coordinator that records calls and optionally delays/fails."""
+    """Coordinator that records calls and optionally delays/fails.
 
-    def __init__(self, delay: float = 0, fail: bool = False) -> None:
+    fail=True raises a generic RuntimeError (the retryable case). Pass an
+    Exception instance instead to control exactly what's raised — e.g. a
+    LLMBudgetExceededError, which the Scheduler must treat differently.
+    """
+
+    def __init__(self, delay: float = 0, fail: bool | Exception = False) -> None:
         self.delay = delay
         self.fail = fail
         self.calls: list[str] = []
@@ -22,8 +27,10 @@ class MockCoordinator:
         self.calls.append(incident_id)
         if self.delay:
             await asyncio.sleep(self.delay)
-        if self.fail:
+        if self.fail is True:
             raise RuntimeError("mock failure")
+        if isinstance(self.fail, Exception):
+            raise self.fail
 
 
 @pytest.mark.asyncio
@@ -96,6 +103,36 @@ async def test_retry_on_failure():
 
     # 1 initial + 2 retries = 3 calls
     assert len(coord.calls) == 3
+
+
+@pytest.mark.asyncio
+async def test_budget_exceeded_skips_retry():
+    """A budget-exceeded failure is not retried — it fails identically every
+    time until the window resets, so retrying only head-of-line-blocks the
+    queue behind attempts that are guaranteed to fail the same way."""
+    from datetime import datetime, timezone
+
+    from observability_agent.domain.models import Incident
+    from observability_agent.infrastructure.llm_budget import LLMBudgetExceededError
+
+    repo = InMemoryIncidentRepository()
+    inc = Incident(cluster_id="test", title="test")
+    await repo.save(inc)
+
+    err = LLMBudgetExceededError("daily", 500_000, 500_000, datetime.now(timezone.utc))
+    coord = MockCoordinator(fail=err)
+    sched = Scheduler(coordinator=coord, repo=repo, max_concurrent=1, max_retries=3)
+
+    sched.enqueue(inc.id)
+    await sched.start()
+    await asyncio.sleep(0.3)
+    await sched.stop()
+
+    assert len(coord.calls) == 1  # no retries — contrast with test_retry_on_failure's 3
+
+    saved = await repo.get(inc.id)
+    assert saved.llm_budget_exceeded
+    assert not saved.is_stale
 
 
 @pytest.mark.asyncio

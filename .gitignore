@@ -37,6 +37,7 @@ htmlcov/
 # Local environment / secrets
 .env
 .env.*
+!.env.example
 kubeconfig
 *.pem
 *.key

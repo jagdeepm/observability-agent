@@ -16,6 +16,23 @@ prometheus:
     evaluationInterval: 15s
     # Accept OTLP push from the otel-demo collector (POST /api/v1/otlp/v1/metrics)
     enableOTLPReceiver: true
+    otlp:
+      # Without this, Prometheus drops OTLP *resource* attributes, so every metric
+      # the demo's SDKs emit (http_server_*, rpc_server_*) arrives with no
+      # service_name and all 15 services collapse into one anonymous series.
+      # Only the collector-generated spanmetrics survive, because service.name is
+      # an explicit dimension there rather than a resource attribute.
+      promoteResourceAttributes:
+        - service.name
+        - service.namespace
+        - k8s.namespace.name
+        - k8s.pod.name
+        - k8s.deployment.name
+    # OTLP is a push protocol, so samples arrive in whatever order the collector's
+    # batches land. Without an out-of-order window Prometheus silently drops the
+    # late ones, which shows up as gaps in exactly the series the alerts read.
+    tsdb:
+      outOfOrderTimeWindow: 30m
     # Don't require persistent volumes on Kind
     storageSpec:
       volumeClaimTemplate:

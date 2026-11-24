@@ -429,6 +429,74 @@ def test_rca_report():
     assert report["remediation"] == "rollback checkout deployment to v1.2.3"
 
 
+def test_rca_report_includes_exploratory_evidence():
+    inc = Incident(cluster_id="c", title="cart errors")
+    inc.acknowledge()
+    inc.add_evidence(Evidence(
+        source=EvidenceSource.LOKI, query="q", summary="errors",
+        signals={"error_count": 12}, collected_by="logs_agent",
+    ))
+    root = inc.add_hypothesis("cart dependency down", created_by="coordinator")
+    inc.add_evidence(Evidence(
+        source=EvidenceSource.PROMETHEUS, query="q", summary="rate up",
+        hypothesis_id=root.id, collected_by="metrics_agent",
+    ))
+    root.confirm(0.9)
+    inc.produce_rca()
+
+    evidence = inc.rca_report()["evidence"]
+    assert {e["source"] for e in evidence} == {"loki", "prometheus"}
+    assert any(e["signals"].get("error_count") == 12 for e in evidence)
+
+
+def test_rca_report_carries_computed_signals():
+    """Measured facts reach the report, not just the narrative summary.
+
+    Without this the deterministic analysis is invisible to every consumer of the
+    API — a reader cannot check the prose against the numbers behind it.
+    """
+    inc = Incident(cluster_id="us-east-1", title="Checkout latency > 500ms")
+    inc.acknowledge()
+    hyp = inc.add_hypothesis("checkout is slow", created_by="coordinator")
+    inc.add_evidence(
+        Evidence(
+            source=EvidenceSource.PROMETHEUS,
+            query="up",
+            summary="Latency is elevated.",
+            signals={"anomaly": True, "p95": 0.82, "spike_count": 3},
+            hypothesis_id=hyp.id,
+            collected_by="metrics_agent",
+        )
+    )
+    hyp.confirm(0.9)
+    inc.produce_rca()
+
+    signals = inc.rca_report()["evidence"][0]["signals"]
+    assert signals["anomaly"] is True
+    assert signals["p95"] == 0.82
+    assert signals["spike_count"] == 3
+
+
+def test_rca_report_signals_default_to_empty():
+    """Sources without deterministic analysis still serialize cleanly."""
+    inc = Incident(cluster_id="us-east-1", title="Checkout latency > 500ms")
+    inc.acknowledge()
+    hyp = inc.add_hypothesis("a bad deploy went out", created_by="coordinator")
+    inc.add_evidence(
+        Evidence(
+            source=EvidenceSource.DEPLOYMENT,
+            query="git log -1",
+            summary="v1.2.4 shipped 6 minutes before the alert.",
+            hypothesis_id=hyp.id,
+            collected_by="deployment_agent",
+        )
+    )
+    hyp.confirm(0.7)
+    inc.produce_rca()
+
+    assert inc.rca_report()["evidence"][0]["signals"] == {}
+
+
 # ---------------------------------------------------------------------------
 # Stale detection
 # ---------------------------------------------------------------------------
@@ -442,6 +510,46 @@ def test_flag_stale():
     inc.flag_stale()
     assert inc.is_stale
     assert inc.stale_flagged_at is not None
+
+
+# ---------------------------------------------------------------------------
+# LLM budget exceeded — spec: docs/specs/investigation-cost-guardrails.md
+# ---------------------------------------------------------------------------
+
+
+def test_flag_budget_exceeded():
+    inc = Incident(cluster_id="us-east-1", title="Test")
+    inc.acknowledge()
+    assert not inc.llm_budget_exceeded
+
+    inc.flag_budget_exceeded()
+
+    assert inc.llm_budget_exceeded
+    assert inc.budget_exceeded_flagged_at is not None
+
+
+def test_flag_budget_exceeded_is_distinct_from_stale():
+    """A human reading the incident later should be able to tell the two
+    causes apart — 'ran out of budget' is not 'took too long'."""
+    inc = Incident(cluster_id="us-east-1", title="Test")
+    inc.acknowledge()
+
+    inc.flag_budget_exceeded()
+
+    assert inc.llm_budget_exceeded
+    assert not inc.is_stale
+    assert inc.stale_flagged_at is None
+
+
+def test_flag_budget_exceeded_logs_a_distinct_reason():
+    inc = Incident(cluster_id="us-east-1", title="Test")
+    inc.acknowledge()
+
+    inc.flag_budget_exceeded()
+
+    note = inc.audit_log[-1].note
+    assert "budget" in note.lower()
+    assert "time threshold" not in note.lower()
 
 
 # ---------------------------------------------------------------------------

@@ -305,6 +305,8 @@ class Incident(BaseModel):
     updated_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
     is_stale: bool = False
     stale_flagged_at: datetime | None = None
+    llm_budget_exceeded: bool = False
+    budget_exceeded_flagged_at: datetime | None = None
 
     # ---- State transitions ----
 
@@ -400,6 +402,20 @@ class Incident(BaseModel):
         self.stale_flagged_at = datetime.now(timezone.utc)
         self._log("system", "flagged_stale", "Incident has exceeded investigation time threshold")
 
+    def flag_budget_exceeded(self) -> None:
+        """Mark the investigation halted by a configured LLM token ceiling.
+
+        Deliberately distinct from flag_stale — "ran out of budget" and "took
+        too long" are different causes, and a human reading this later should
+        not have to guess which one happened from an is_stale bool alone.
+        """
+        self.llm_budget_exceeded = True
+        self.budget_exceeded_flagged_at = datetime.now(timezone.utc)
+        self._log(
+            "system", "flagged_budget_exceeded",
+            "Investigation halted — LLM token budget exceeded, human review needed",
+        )
+
     # ---- Hypothesis management ----
 
     def add_hypothesis(
@@ -473,7 +489,11 @@ class Incident(BaseModel):
         path = best_leaf.confirmed_path(self.hypotheses)
         causal_chain = [h.statement for h in (path or [best_leaf])]
 
-        all_evidence = []
+        # Exploratory evidence (all six sources, gathered before any hypothesis
+        # existed) belongs in the report too. Only hypothesis-attached evidence
+        # used to be listed, and _pick_source routes most hypotheses to Prometheus,
+        # so the computed log signals (error_count) never reached the RCA.
+        all_evidence = list(self.exploratory_evidence)
         for h in path or [best_leaf]:
             all_evidence.extend(h.evidence)
 
@@ -491,6 +511,9 @@ class Incident(BaseModel):
                     "source": e.source.value,
                     "query": e.query,
                     "summary": e.summary,
+                    # The measured facts, so a reader can check the narrative
+                    # against the numbers without opening a dashboard.
+                    "signals": e.signals,
                     "collected_by": e.collected_by,
                 }
                 for e in all_evidence

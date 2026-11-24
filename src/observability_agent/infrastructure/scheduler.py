@@ -14,6 +14,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 from observability_agent.domain.models import IncidentStatus
+from observability_agent.infrastructure.llm_budget import LLMBudgetExceededError
 
 logger = logging.getLogger(__name__)
 
@@ -128,6 +129,17 @@ class Scheduler:
             self._running[incident_id] = asyncio.current_task()
             try:
                 await self.coordinator.run(incident_id)
+            except LLMBudgetExceededError as exc:
+                # Not retried: the check happens before any network call, so
+                # every retry would fail identically until the budget window
+                # resets. Retrying anyway would only re-queue this incident at
+                # the front three more times, head-of-line-blocking everything
+                # else behind attempts guaranteed to fail the same way.
+                logger.error("Investigation %s halted — %s", incident_id, exc)
+                incident = await self.repo.get(incident_id)
+                if incident and incident.status.is_active:
+                    incident.flag_budget_exceeded()
+                    await self.repo.save(incident)
             except Exception as exc:
                 logger.error("Investigation %s failed: %s", incident_id, exc)
                 retries = self._retries.get(incident_id, 0) + 1

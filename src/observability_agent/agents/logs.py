@@ -52,6 +52,45 @@ class LogsAgent:
                 collected_by="logs_agent",
             )
 
+    async def _label_names(self) -> list[str]:
+        """The label names this Loki actually has, or [] if they can't be read.
+
+        Label discovery must never fail the investigation — an unreachable Loki
+        should degrade to a generic prompt, not to no evidence at all.
+        """
+        try:
+            return sorted(await self.loki.list_labels())
+        except Exception as exc:
+            logger.debug("Loki label discovery failed: %s", exc)
+            return []
+
+    @staticmethod
+    def _translate_system_prompt(labels: list[str]) -> str:
+        """Build the NL→LogQL system prompt, naming the labels that exist.
+
+        Without this the prompt suggested `{service="name"}` as the example
+        selector. No Loki fed by Promtail has a `service` label — it labels by
+        Kubernetes metadata — so the model dutifully wrote a selector matching
+        nothing, and then reached for `| json | pattern ...` to compensate, which
+        Loki rejects with a 500. Naming the real labels removes both failures.
+        """
+        available = (
+            f"The only label names in this Loki are: {', '.join(labels)}. "
+            "Use nothing else — a selector on a label that does not exist matches "
+            "no streams."
+            if labels
+            else "Prefer Kubernetes labels such as namespace, pod, container and app."
+        )
+        return (
+            "You are a Loki/LogQL expert. Translate natural language queries into "
+            f"valid LogQL. {available} "
+            "Use |= for substring search and |~ for regex. Log levels are written in "
+            "any case (\"Error\", \"ERROR\", \"error\"), so make regex filters "
+            "case-insensitive: |~ \"(?i)error|fail|exception\". Keep the pipeline simple: "
+            "a label selector plus at most one line filter. Do not use json, pattern, "
+            "unwrap or label_format. Do not put a time range in the query itself."
+        )
+
     async def _execute(
         self, nl: str, hypothesis_id: str | None, extra_context: dict[str, Any] | None,
     ) -> Evidence:
@@ -61,12 +100,7 @@ class LogsAgent:
         logql_output = await self.llm.generate_structured(
             prompt=f"Query: {nl}\nService: {service}\nTranslate to LogQL.",
             output_schema=LogQLOutput,
-            system_prompt=(
-                "You are a Loki/LogQL expert. Translate natural language queries into "
-                "valid LogQL. Use label selectors like {service=\"name\"} when a service "
-                "is specified. Use |= for text search, |~ for regex. Include a time range "
-                "via the query parameters, not in the LogQL itself."
-            ),
+            system_prompt=self._translate_system_prompt(await self._label_names()),
         )
         assert isinstance(logql_output, LogQLOutput)
 

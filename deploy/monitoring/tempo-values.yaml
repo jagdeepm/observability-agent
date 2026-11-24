@@ -1,0 +1,25 @@
+# Tempo single-binary — trace backend for the TraceAgent.
+#
+# Deployed as release "tempo" in the monitoring namespace, so the service resolves at
+# tempo.monitoring.svc.cluster.local:3200 (query API — matches TEMPO_URL in
+# deploy/agent/configmap.yaml) and :4317 (OTLP gRPC, where the demo collector pushes).
+#
+# The chart's default receiver set already includes OTLP on 4317/4318, so there is
+# nothing to configure there. It also opens Jaeger and Zipkin ports we do not use;
+# idle listeners are cheaper than fighting Helm's map merge to remove them.
+
+tempo:
+  # ponytail: matches Prometheus' 2h retention — long enough to investigate an
+  # incident, short enough that Kind's disk never becomes the problem.
+  retention: 2h
+
+persistence:
+  enabled: false
+
+resources:
+  requests:
+    cpu: 50m
+    memory: 128Mi
+  limits:
+    cpu: 500m
+    memory: 512Mi

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
+from types import SimpleNamespace
 
 import pytest
 from starlette.testclient import TestClient
@@ -45,6 +46,56 @@ def test_health_endpoint():
     resp = client.get("/health")
     assert resp.status_code == 200
     assert resp.json()["status"] == "ok"
+
+
+class _FakeScheduler:
+    queue_size = 0
+    running_count = 0
+
+    def __init__(self, llm: object) -> None:
+        self.coordinator = SimpleNamespace(llm=llm)
+
+
+def test_health_reports_llm_budget_when_configured():
+    """A real PydanticAIProvider exposes budget_status(); /health surfaces it
+    without a human having to open individual incidents to notice."""
+    repo = InMemoryIncidentRepository()
+    llm = SimpleNamespace(budget_status=lambda: {
+        "daily": {"used": 10, "limit": 100},
+        "weekly": {"used": 10, "limit": None},
+    })
+    app = create_app(repo, scheduler=_FakeScheduler(llm))
+    client = TestClient(app)
+
+    resp = client.get("/health")
+
+    assert resp.json()["llm_budget"] == {
+        "daily": {"used": 10, "limit": 100},
+        "weekly": {"used": 10, "limit": None},
+    }
+
+
+def test_health_omits_llm_budget_without_a_scheduler():
+    repo = InMemoryIncidentRepository()
+    app = create_app(repo)
+    client = TestClient(app)
+
+    resp = client.get("/health")
+
+    assert "llm_budget" not in resp.json()
+
+
+def test_health_omits_llm_budget_for_a_provider_without_one():
+    """MockLLMProvider has no budget_status — duck-typed absence, not a null
+    placeholder, so a mock-LLM deployment's /health stays unambiguous."""
+    repo = InMemoryIncidentRepository()
+    llm_without_budget = SimpleNamespace()  # no budget_status attribute
+    app = create_app(repo, scheduler=_FakeScheduler(llm_without_budget))
+    client = TestClient(app)
+
+    resp = client.get("/health")
+
+    assert "llm_budget" not in resp.json()
 
 
 def test_receive_alert_creates_incident():

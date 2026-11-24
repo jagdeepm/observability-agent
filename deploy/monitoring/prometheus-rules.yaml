@@ -1,5 +1,14 @@
-# PrometheusRules — alert definitions for the OpenTelemetry Demo
-# These fire when the demo app exhibits issues, triggering the agent's investigation
+# PrometheusRules — alert definitions for the OpenTelemetry Demo.
+# These fire when the demo app misbehaves, which triggers the agent's investigation.
+#
+# Two groups: recording rules normalise the source metrics, alerts read the
+# normalised series. That indirection earns its keep because the metric names are a
+# moving target — the demo's services span nine languages at different semconv
+# versions, and the spanmetrics connector is mid-migration from milliseconds to
+# seconds. Rather than pin one name and discover it was wrong after a ten-minute
+# cluster build, the recording rule accepts whichever series exists.
+#
+# `task discover-metrics` prints what the running Prometheus actually has.
 apiVersion: monitoring.coreos.com/v1
 kind: PrometheusRule
 metadata:
@@ -9,13 +18,79 @@ metadata:
     release: kube-prometheus-stack
 spec:
   groups:
+    # -----------------------------------------------------------------------
+    # Recording rules — one canonical series per concept, in base units.
+    # -----------------------------------------------------------------------
+    - name: otel-demo-recording
+      interval: 15s
+      rules:
+        # P99 server-side latency, in seconds, per service.
+        #
+        # Source is the spanmetrics connector: the collector derives it from every
+        # span, so it is uniform across the demo's nine languages. The SDKs' own
+        # HTTP metrics are not usable here — half the services are gRPC, and the
+        # HTTP ones disagree on semconv version (`http_server_duration_milliseconds`
+        # vs `http_server_request_duration_seconds`).
+        #
+        # The `or` covers the connector's pending milliseconds → seconds migration.
+        # Observed on chart 0.41.0: milliseconds. Only one branch has data, so no
+        # series is counted twice.
+        - record: otel:service_latency_p99_seconds
+          expr: |
+            histogram_quantile(0.99, sum by (service_name, le) (
+              rate(traces_span_metrics_duration_milliseconds_bucket{span_kind="SPAN_KIND_SERVER"}[5m])
+            )) / 1000
+            or
+            histogram_quantile(0.99, sum by (service_name, le) (
+              rate(traces_span_metrics_duration_seconds_bucket{span_kind="SPAN_KIND_SERVER"}[5m])
+            ))
+
+        # Server calls ending in error, per second, per service.
+        #
+        # Span status alone is not enough. The .NET cart service returns gRPC
+        # FAILED_PRECONDITION under `cartFailure` but leaves its server span
+        # STATUS_CODE_UNSET, so a status-only rule cannot see that fault at all —
+        # verified against a live cluster, not assumed.
+        #
+        # So take the union of the three signals. All three select the same metric,
+        # so `or` deduplicates: a span that is both STATUS_CODE_ERROR and gRPC
+        # non-zero is one series, counted once.
+        - record: otel:service_errors_per_second
+          expr: |
+            sum by (service_name) (
+              rate(traces_span_metrics_calls_total{span_kind="SPAN_KIND_SERVER", status_code="STATUS_CODE_ERROR"}[5m])
+              or
+              rate(traces_span_metrics_calls_total{span_kind="SPAN_KIND_SERVER", rpc_grpc_status_code=~"[1-9][0-9]*"}[5m])
+              or
+              rate(traces_span_metrics_calls_total{span_kind="SPAN_KIND_SERVER", http_response_status_code=~"5.."}[5m])
+            )
+
+        - record: otel:service_calls_per_second
+          expr: |
+            sum by (service_name) (
+              rate(traces_span_metrics_calls_total{span_kind="SPAN_KIND_SERVER"}[5m])
+            )
+
+        # Absent errors the numerator is an empty vector, and `A / B` on an empty A
+        # yields nothing rather than zero — which is the behaviour we want: no
+        # series, no alert.
+        - record: otel:service_error_ratio
+          expr: |
+            otel:service_errors_per_second / otel:service_calls_per_second
+
+    # -----------------------------------------------------------------------
+    # Alerts — all routed to the agent's webhook by alertmanager-config.yaml.
+    # -----------------------------------------------------------------------
     - name: otel-demo
       interval: 15s
       rules:
-        # ---- Latency alerts ----
+        # 4s, not the 500ms an SLO would use. Measured baseline on an idle Kind
+        # cluster: frontend-proxy P99 ~2.5s, ad ~1.9s (Java JIT warmup) with no
+        # fault injected. At 500ms those two alert permanently, and an e2e test
+        # waiting for HighLatency matches the standing alert instead of the fault
+        # it injected. The injected slowdowns are 5–10s, so 4s still catches them.
         - alert: HighLatency
-          expr: |
-            histogram_quantile(0.99, rate(http_server_duration_bucket{service_name=~"checkoutservice|frontend|cartservice"}[5m])) > 0.5
+          expr: otel:service_latency_p99_seconds > 4
           for: 1m
           labels:
             severity: critical
@@ -25,10 +100,13 @@ spec:
             summary: '{{ $labels.service_name }} P99 latency > 500ms'
             description: 'P99 latency for {{ $labels.service_name }} is {{ $value | humanizeDuration }} over the last 5 minutes.'
 
+        # 2%, from measurement on a live cluster rather than a round number:
+        #   baseline (no fault)   every service < 0.5%
+        #   cartFailure=100%      cart 4.5%   (only EmptyCart fails, not all traffic)
+        #   paymentFailure=100%   payment 26%, checkout 26% (propagates upstream)
+        # At the conventional 10% the cart scenario never alerts at all.
         - alert: HighErrorRate
-          expr: |
-            rate(http_server_duration_count{service_name=~"checkoutservice|frontend|cartservice", http_response_status_code=~"5.."}[5m])
-            / rate(http_server_duration_count{service_name=~"checkoutservice|frontend|cartservice"}[5m]) > 0.1
+          expr: otel:service_error_ratio > 0.02
           for: 1m
           labels:
             severity: critical
@@ -38,22 +116,26 @@ spec:
             summary: '{{ $labels.service_name }} error rate > 10%'
             description: '{{ $labels.service_name }} has a {{ $value | humanizePercentage }} error rate over the last 5 minutes.'
 
-        # ---- Pod restart alert ----
+        # ---- Pod-level alerts (kube-state-metrics / cAdvisor) ----
+        # These read the cluster, not the demo's instrumentation, so they fire
+        # even when the OTLP pipeline is misconfigured.
         - alert: PodRestarting
           expr: |
             rate(kube_pod_container_status_restarts_total{namespace="otel-demo"}[10m]) > 0
           for: 1m
           labels:
             severity: warning
+            service: '{{ $labels.container }}'
             cluster: kind-e2e
           annotations:
             summary: 'Pod {{ $labels.pod }} is restarting'
             description: '{{ $labels.container }} in pod {{ $labels.pod }} has restarted {{ $value }} times in the last 10 minutes.'
 
-        # ---- CPU pressure alert ----
         - alert: HighCPU
           expr: |
-            rate(container_cpu_usage_seconds_total{namespace="otel-demo", container!=""}[5m]) * 100 > 1
+            sum by (namespace, pod, container) (
+              rate(container_cpu_usage_seconds_total{namespace="otel-demo", container!=""}[5m])
+            ) > 0.4
           for: 1m
           labels:
             severity: warning
@@ -61,4 +143,19 @@ spec:
             cluster: kind-e2e
           annotations:
             summary: '{{ $labels.container }} CPU usage is high'
-            description: 'Container {{ $labels.container }} has been using {{ $value | humanize }}% CPU for the last 5 minutes.'
+            description: 'Container {{ $labels.container }} has been using {{ $value | humanize }} cores for the last 5 minutes.'
+
+        - alert: PodNotReady
+          expr: |
+            kube_pod_status_ready{namespace="otel-demo", condition="true"} == 0
+          for: 2m
+          labels:
+            severity: warning
+            # Without this the alert inherits kube-state-metrics' own `service`
+            # label (the scrape target), and the agent goes off investigating
+            # kube-prometheus-stack instead of the demo pod that is down.
+            service: '{{ $labels.pod }}'
+            cluster: kind-e2e
+          annotations:
+            summary: 'Pod {{ $labels.pod }} is not ready'
+            description: 'Pod {{ $labels.pod }} has failed its readiness probe for over 2 minutes.'

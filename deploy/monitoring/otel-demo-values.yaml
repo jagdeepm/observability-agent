@@ -1,0 +1,67 @@
+# opentelemetry-demo values — point the demo's collector at OUR monitoring stack.
+#
+# The chart ships its own Prometheus, Jaeger, Grafana and OpenSearch and exports to
+# them by name. We disable all four and re-target the exporters, otherwise both the
+# metrics and traces pipelines export into services that do not exist and the agent
+# has nothing to investigate.
+#
+# Logs are deliberately not exported here — Promtail already tails every pod's
+# stdout into Loki (deploy/monitoring/loki-values.yaml), which is where the
+# LogsAgent looks.
+
+# Bundled backends — replaced by kube-prometheus-stack, Tempo and Loki.
+prometheus:
+  enabled: false
+jaeger:
+  enabled: false
+grafana:
+  enabled: false
+opensearch:
+  enabled: false
+
+components:
+  # Demo 3.x ships an LLM-backed assistant that needs its own model credentials
+  # and adds three pods we never investigate. Off.
+  agent:
+    enabled: false
+  chatbot:
+    enabled: false
+  mcp:
+    enabled: false
+
+opentelemetry-collector:
+  resources:
+    requests:
+      cpu: 50m
+      memory: 128Mi
+    limits:
+      memory: 400Mi
+  config:
+    exporters:
+      # Prometheus with --web.enable-otlp-receiver; the exporter appends /v1/metrics.
+      otlp_http/prometheus:
+        endpoint: http://kube-prometheus-stack-prometheus.monitoring.svc.cluster.local:9090/api/v1/otlp
+      # Tempo speaks OTLP gRPC on 4317 — a drop-in for the chart's Jaeger exporter.
+      otlp_grpc/jaeger:
+        endpoint: tempo.monitoring.svc.cluster.local:4317
+    connectors:
+      span_metrics:
+        # Span *status* is not a reliable error signal across the demo's nine
+        # languages: the .NET cart service returns gRPC FAILED_PRECONDITION under
+        # `cartFailure` while leaving its server span STATUS_CODE_UNSET, so a
+        # status-only rule cannot see the injected fault at all.
+        #
+        # Promoting the protocol status codes to span-metric dimensions gives one
+        # metric that carries all three error signals, so the alert rule can take
+        # their union instead of trusting whichever one a given SDK sets.
+        dimensions:
+          - name: rpc.grpc.status_code
+          - name: http.response.status_code
+    service:
+      pipelines:
+        # Overriding only the exporter list; receivers and processors come from
+        # the chart so upstream pipeline changes still apply.
+        logs:
+          exporters: [debug]
+        profiles:
+          exporters: [debug]

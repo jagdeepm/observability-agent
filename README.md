@@ -99,14 +99,16 @@ Uses canned mock responses. Prints a full RCA report to stdout.
 ### Real investigation (requires LLM API key)
 
 ```bash
-export LLM_MODEL="openai:gpt-4o"
-export LLM_API_KEY="sk-..."
+cp .env.example .env    # then fill in LLM_BASE_URL, LLM_API_KEY, LLM_MODEL
+set -a && source .env && set +a
 
 observability-agent investigate \
   --service checkout \
   --alert "latency > 500ms" \
   --severity critical
 ```
+
+Any OpenAI-compatible endpoint works — OpenAI, a LiteLLM proxy, or a local model server. The `task` targets load `.env` on their own; only direct CLI invocations need the `source` above.
 
 ### API server (Alertmanager webhook)
 
@@ -249,12 +251,21 @@ src/observability_agent/
 
 | Env Var | Default | Description |
 |---|---|---|
-| `LLM_MODEL` | `openai:gpt-4o` | Model identifier (PydanticAI format) |
+Copy [`.env.example`](.env.example) to `.env` and edit it. Every `task` target loads `.env` automatically; a variable exported in your shell takes precedence, so CI can inject secrets without a file.
+
+| Env Var | Default | Description |
+|---|---|---|
+| `LLM_MODEL` | `openai:gpt-4o` | Model identifier. `provider:model` strips the prefix; anything else passes through verbatim |
 | `LLM_API_KEY` | `""` | API key for the LLM provider |
-| `LLM_BASE_URL` | `""` | Base URL for OpenAI-compatible endpoints |
-| `LLM_MOCK` | `false` | Use `MockLLMProvider` (set to `true` for offline dev) |
+| `LLM_BASE_URL` | `""` | Base URL for OpenAI-compatible endpoints (include `/v1`) |
+| `LLM_MOCK` | `false` | Use `MockLLMProvider` (offline dev; prefer `serve --mock-llm`) |
+| `PROMETHEUS_URL` | `http://localhost:9090` | Prometheus query API |
+| `LOKI_URL` | `http://localhost:3100` | Loki query API |
+| `TEMPO_URL` | `http://localhost:3200` | Tempo query API |
 | `MAX_CONCURRENT_INVESTIGATIONS` | `3` | Max concurrent Coordinator runs |
 | `STALE_THRESHOLD_HOURS` | `24` | Hours before an investigation is flagged stale |
+| `LLM_TOKEN_BUDGET_DAILY` | unset (no ceiling) | Cumulative input+output tokens allowed per UTC day. In-memory, resets on restart — see [spec](docs/specs/investigation-cost-guardrails.md) |
+| `LLM_TOKEN_BUDGET_WEEKLY` | unset (no ceiling) | Same, per UTC week (Monday–Monday) |
 
 ## Testing
 
@@ -262,13 +273,14 @@ src/observability_agent/
 pytest tests/ -v -m "not e2e"
 ```
 
-57 tests covering:
+93 tests covering:
 - **Domain model** — state machines, hypothesis tree, RCA projection, remediation lifecycle
 - **Coordinator** — full lifecycle, exploratory evidence, hypothesis generation/evaluation, pruning, agent failure, save-after-each-step
-- **MetricsAgent** — NL→PromQL translation, Prometheus error handling
+- **Metrics / Logs / Traces agents** — NL→query translation, error handling, and the computed signals from deterministic analysis
 - **Scheduler** — enqueue, concurrency cap, critical priority, retry on failure
 - **Alert Receiver** — webhook handling, alert grouping, incident creation
 - **Memory Store** — archive, search, retrieval
+- **E2E fault helpers** — flagd flag flipping and reset, without a cluster
 
 All external dependencies are mocked. Tests run in < 1 second with no network calls.
 
@@ -282,13 +294,16 @@ Runs a full mock investigation from alert to RCA with assertions.
 
 ### End-to-End
 
-A full e2e harness deploys the agent into a local [Kind](https://kind.sigs.k8s.io/) cluster alongside `kube-prometheus-stack`, Loki, and the [OpenTelemetry Astronomy Shop](https://github.com/open-telemetry/opentelemetry-demo) demo (12 microservices). It injects faults — latency spikes, error rates, pod crashes — then asserts that Prometheus fires an alert and the agent autonomously produces an RCA.
+A full e2e harness deploys the agent into a local [Kind](https://kind.sigs.k8s.io/) cluster alongside `kube-prometheus-stack`, Loki, Tempo, and the [OpenTelemetry Astronomy Shop](https://github.com/open-telemetry/opentelemetry-demo) demo. Faults come from the demo's own flagd feature flags, so the failures are real — the service genuinely errors, genuinely logs, genuinely shows up in traces. The tests then assert that Prometheus fires an alert and the agent autonomously produces an RCA.
 
 ```bash
-task all        # cluster → monitoring → demo → agent → tests (~10–15 min first run)
+task env-init   # create .env, then fill in your LLM settings
+task all        # cluster → monitoring → loki → tempo → demo → agent → tests
 task status     # what's currently running
 task teardown   # delete the cluster
 ```
+
+Beyond RCA shape, the e2e tests assert on **computed signals** — that `error_count`, `p95` and `slowest_self_ms` appear on the Evidence after a real fault. Those come from `analysis.py`, which falls back silently to truncation on an unfamiliar payload shape; a live stack is the only place that fallback is detectable.
 
 Requires Kind, Helm, [Task](https://taskfile.dev/), and Docker. See [`docs/e2e-testing.md`](docs/e2e-testing.md) for the full guide.
 
