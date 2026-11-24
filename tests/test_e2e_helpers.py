@@ -56,6 +56,14 @@ def test_set_flag_writes_the_variant(flagd):
     assert flagd["config"]["flags"]["cartFailure"]["defaultVariant"] == "100%"
 
 
+def test_set_flag_drops_targeting_that_would_override_the_variant(flagd):
+    flagd["config"]["flags"]["cartFailure"]["targeting"] = {"if": [True, "off", "off"]}
+
+    helpers.set_flag("cartFailure", "100%")
+
+    assert "targeting" not in flagd["config"]["flags"]["cartFailure"]
+
+
 def test_set_flag_restarts_flagd(flagd):
     """flagd serves an emptyDir copy that its initContainer makes at pod start, so
     a ConfigMap patch is invisible until the pod restarts. Without the rollout the

@@ -106,6 +106,12 @@ def set_flag(flag_name: str, variant: str) -> None:
             f"Available: {', '.join(sorted(variants))}"
         )
     flags[flag_name]["defaultVariant"] = variant
+    # A `targeting` rule outranks defaultVariant. productCatalogFailure ships one
+    # that resolves to "off" for every product, so flipping the default alone
+    # injected no fault at all: no errors, no alert, a 600s timeout. Dropping the
+    # rule makes the variant apply to every request (a bigger fault than the
+    # demo's single-product one, but a deterministic one).
+    flags[flag_name].pop("targeting", None)
     _write_flagd_config(config)
     logger.info("flagd: %s = %s", flag_name, variant)
 
